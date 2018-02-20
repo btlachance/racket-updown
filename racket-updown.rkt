@@ -8,6 +8,8 @@
            check-code?
            negate
            number?
+           add1
+           sub1
            (rename-out [ud:module-begin #%module-begin]
                        [ud:lambda lambda]
                        [ud:app #%app]
@@ -19,12 +21,19 @@
   (define (code-print c port mode)
     (define exp (code-e c))
     (pretty-display "<code " port #:newline? #f)
-    (pretty-display (syntax->datum exp) port #:newline? #f)
+    (pretty-display
+     ;; Haven't thought through why arbitrary values ended up in code
+     ;; in the first place
+     (if (syntax? exp)
+         (syntax->datum exp)
+         exp)
+     port #:newline? #f)
     (pretty-display ">" port #:newline? #f))
   (struct code (e)
     #:transparent
     #:methods gen:custom-write
     [(define write-proc code-print)])
+  (define not-code? (negate code?))
 
   (struct liftable-proc (value rec arg body)
     #:property prop:procedure (struct-field-index value))
@@ -43,11 +52,36 @@
     (syntax-parse stx
       [(_ . datum) #`(#%datum . datum)]))
 
+  ;; Only values of certain expressions can participate in an implicit
+  ;; lifting. This restriction is mostly because of side effects: if
+  ;; an expression could have side effects, I'm not confident I want
+  ;; to produce a code version of that expression after I already
+  ;; evaluated the expresson once. The `simple?` below is given the
+  ;; expression a user wrote, which probably isn't safe if I want the
+  ;; side-effect eliminating part of things to be sound (e.g. what if
+  ;; stx is an identifer that expands to something complex?). But it's
+  ;; a start. Maybe this is another reason why let-insertion is useful
+  ;; (but if the core of my language was ANF'd before any runtime,
+  ;; then maybe implicit lifting would be just as easy...)
+  (define (simple? stx)
+    (or (identifier? stx)
+        (number? (syntax-e stx))))
+  (define (bad-implicit-lift datum)
+    (error "implicit lift of non-simple:" datum))
+
   (define-syntax (ud:app stx)
     (syntax-parse stx
       [(_ e-op e-arg)
        #`(match* (e-op e-arg)
-           [((code op) (code arg)) (code #`(ud:app (void) (void)))]
+           [((? not-code? op) (code arg))
+            (unless (simple? #'e-op)
+              (bad-implicit-lift (syntax->datum #'e-op)))
+            (code #`(ud:app e-op #,arg))]
+           [((code op) (? not-code? arg))
+            (unless (simple? #'e-arg)
+              (bad-implicit-lift (syntax->datum #'e-arg)))
+            (code #`(ud:app #,op e-arg))]
+           [((code op) (code arg)) (code #`(ud:app #,op #,arg))]
            [(v1 v2)
             (if (liftable-proc? v1)
                 (#%app v1 v1 v2)
@@ -61,14 +95,24 @@
       [(? zero? _) e2]
       [_ e3]))
 
-  (define (lift v)
+  (define (fresh-var [name 'var]) (gensym name))
+  (define (lift v [mumble #f])
     (define v-exp
       (match v
         [(? number? v) #`(ud:datum . #,v)]
         [(liftable-proc proc rec arg body)
+         (define rec-fresh (fresh-var (syntax-e rec)))
+         (define arg-fresh (fresh-var (syntax-e arg)))
          #`(ud:lambda
-            #,rec (#,arg)
-            (void))]
+            #,rec-fresh (#,arg-fresh)
+            #,(match (eval-code-exp #`((ud:lambda #,rec (#,arg) #,body)
+                                       #,(code rec-fresh) #,(code arg-fresh)))
+                [(code reduced-body) reduced-body]
+                [(? not-code? v) v]))]
+        ;; What should happen if we lift an arbitrary function? Maybe
+        ;; we have to only allow lifting liftable-proc and primitive
+        ;; functions (e.g. add1)
+        ;; [(? procedure? p) ...]
         [(code e) #`(ud:lift #,e)]))
     (code v-exp))
   (define-syntax-rule (ud:lift e) (lift e))
@@ -109,12 +153,26 @@
     (check-pred code? e)))
 
 (module test (submod ".." updown)
-  (check-equal? 5 (run 0 (lift 5)))
-  (check-code? (run (lift 1) (lift 5)))
-  (check-equal? 11 (run 0 (run (lift 1) (lift (lift 11)))))
+  (check-code? (lift (add1 1)))
+  (check-equal? (run 0 (lift (add1 1))) 2)
 
-  (check-equal? 111 (if0 0 111 999))
-  (check-equal? 400 (if0 1 9 400))
+  (check-equal? (run 0 (lift 5)) 5)
+  (check-code? (run (lift 1) (lift 5)))
+  (check-equal? (run 0 (run (lift 1) (lift (lift 11)))) 11)
+
+  (check-equal? (if0 0 111 999) 111)
+  (check-equal? (if0 1 9 400) 400)
   (check-code? (if0 (lift 5) 111 999))
 
-  (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1))
+  (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1)
+
+  (check-equal? ((lambda _ (x) (add1 x)) 5) 6)
+  (check-equal? (sub1 10) 9)
+
+  (check-code? (lift (lambda _ (x) (add1 11))))
+  (check-equal? ((run 0 (lift (lambda _ (x) (add1 11)))) 42)
+                12)
+  (check-code? (lift (lambda _ (x) (x 1))))
+  (check-equal? ((run 0 (lift (lambda _ (x) (x 41)))) (lambda _ (x) x)) 41)
+  (check-equal? ((run 0 (lift (lambda _ (x) (add1 x)))) 42)
+                43))
