@@ -48,8 +48,10 @@
       [(_ e-op e-arg)
        #`(match* (e-op e-arg)
            [((code op) (code arg)) (code #`(ud:app (void) (void)))]
-           [((? liftable-proc? v-op) v-arg) (#%app v-op v-op v-arg)]
-           [(v1 v2) (#%app v1 v2)])]
+           [(v1 v2)
+            (if (liftable-proc? v1)
+                (#%app v1 v1 v2)
+                (#%app v1 v2))])]
       [(_ e ...)
        #`(#%app e ...)]))
 
@@ -115,11 +117,9 @@
   (check-equal? 11 (run 0 (run (lift 1) (lift (lift 11)))))
 
   (check-equal? 111 (if0 0 111 999))
-  (check-pred (negate number?) (if0 (lift 5) 111 999)))
+  (check-pred (negate number?) (if0 (lift 5) 111 999))
 
-(module main (submod ".." updown)
-  (run 0 (lift 6))
-  (if0 ((lambda _ (x) x) 1)
-       111
-       999)
-  (if0 (lift 5) 111 999))
+  (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1)
+
+  (check-equal? 400 (if0 0 400 9))
+  (check-pred (negate number?) (if0 (lift 1) 0 10)))
