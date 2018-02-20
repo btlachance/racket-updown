@@ -5,7 +5,7 @@
            rackunit)
   (provide #%top-interaction
            check-equal?
-           check-pred
+           check-code?
            negate
            number?
            (rename-out [ud:module-begin #%module-begin]
@@ -55,13 +55,11 @@
       [(_ e ...)
        #`(#%app e ...)]))
 
-  (define-syntax (ud:if0 stx)
-    (syntax-parse stx
-      [(_ e1 e2 e3)
-       #`(match e1
-           [(code e) (code #`(ud:if0 #,e (void) (void)))]
-           [(? zero? _) e2]
-           [_ e3])]))
+  (define-syntax-rule (ud:if0 e1 e2 e3)
+    (match e1
+      [(code e) (code #`(ud:if0 #,e (void) (void)))]
+      [(? zero? _) e2]
+      [_ e3]))
 
   (define (lift v)
     (define v-exp
@@ -73,22 +71,18 @@
             (void))]
         [(code e) #`(ud:lift #,e)]))
     (code v-exp))
-  (define-syntax (ud:lift stx)
-    (syntax-parse stx
-      [(_ e) #`(lift e)]))
+  (define-syntax-rule (ud:lift e) (lift e))
 
   (define (eval-code-exp e) (eval e (eval-namespace)))
-  (define-syntax (ud:run stx)
-    (syntax-parse stx
-      [(_ b e)
-       #`(match b
-           [(code b1)
-            (code
-             (match e
-               [(code e-code) #`(ud:run #,b1 #,e-code)]))]
-           [_
-            (match e
-              [(code e-code) (eval-code-exp e-code)])])]))
+  (define-syntax-rule (ud:run b e)
+    (match b
+      [(code b1)
+       (code
+        (match e
+          [(code e-code) #`(ud:run #,b1 #,e-code)]))]
+      [_
+       (match e
+         [(code e-code) (eval-code-exp e-code)])]))
 
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
@@ -109,17 +103,18 @@
               ;; installed collection
               (namespace-require (quote-module-path ".." updown)))
             (eval-namespace ns))
-          forms ...)])))
+          forms ...)]))
+
+  (define-syntax-rule (check-code? e)
+    (check-pred code? e)))
 
 (module test (submod ".." updown)
   (check-equal? 5 (run 0 (lift 5)))
-  (check-pred (negate number?) (run (lift 1) (lift 5)))
+  (check-code? (run (lift 1) (lift 5)))
   (check-equal? 11 (run 0 (run (lift 1) (lift (lift 11)))))
 
   (check-equal? 111 (if0 0 111 999))
-  (check-pred (negate number?) (if0 (lift 5) 111 999))
+  (check-equal? 400 (if0 1 9 400))
+  (check-code? (if0 (lift 5) 111 999))
 
-  (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1)
-
-  (check-equal? 400 (if0 0 400 9))
-  (check-pred (negate number?) (if0 (lift 1) 0 10)))
+  (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1))
