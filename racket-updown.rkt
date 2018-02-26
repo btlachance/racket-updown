@@ -1,15 +1,21 @@
 #lang racket
+(module updown-util racket
+  (provide (struct-out code) not-code?)
+  (struct code (e) #:prefab)
+  (define not-code? (negate code?)))
+
 (module updown racket
-  (require (for-syntax syntax/parse)
+  (require (for-syntax syntax/parse (submod ".." updown-util))
+           (submod ".." updown-util)
            syntax/location
            rackunit)
   (provide #%top-interaction
            check-equal?
            check-code?
-           negate
-           number?
+           +
            add1
            sub1
+           trace-eval
            (rename-out [ud:module-begin #%module-begin]
                        [ud:lambda lambda]
                        [ud:app #%app]
@@ -18,25 +24,20 @@
                        [ud:lift lift]
                        [ud:run run]))
 
-  (define (code-print c port mode)
-    (define exp (code-e c))
-    (pretty-display "<code " port #:newline? #f)
-    (pretty-display
-     ;; Haven't thought through why arbitrary values ended up in code
-     ;; in the first place
-     (if (syntax? exp)
-         (syntax->datum exp)
-         exp)
-     port #:newline? #f)
-    (pretty-display ">" port #:newline? #f))
-  (struct code (e)
-    #:transparent
-    #:methods gen:custom-write
-    [(define write-proc code-print)])
-  (define not-code? (negate code?))
 
+  (define (liftable-proc-print lp port mode)
+    (match-define (liftable-proc _ rec arg body) lp)
+    (define result
+      (format
+       "<zliftable-proc ~a (~a) ~a>"
+       (syntax-e rec)
+       (syntax-e arg)
+       (syntax->datum body)))
+    (pretty-display result port #:newline? #f))
   (struct liftable-proc (value rec arg body)
-    #:property prop:procedure (struct-field-index value))
+    #:property prop:procedure (struct-field-index value)
+    #:methods gen:custom-write
+    [(define write-proc liftable-proc-print)])
 
 
   (define-syntax (ud:lambda stx)
@@ -50,74 +51,103 @@
 
   (define-syntax (ud:datum stx)
     (syntax-parse stx
-      [(_ . datum) #`(#%datum . datum)]))
+      [(_ . d:number) #`(#%datum . d)]))
 
-  ;; Only values of certain expressions can participate in an implicit
-  ;; lifting. This restriction is mostly because of side effects: if
-  ;; an expression could have side effects, I'm not confident I want
-  ;; to produce a code version of that expression after I already
-  ;; evaluated the expresson once. The `simple?` below is given the
-  ;; expression a user wrote, which probably isn't safe if I want the
-  ;; side-effect eliminating part of things to be sound (e.g. what if
-  ;; stx is an identifer that expands to something complex?). But it's
-  ;; a start. Maybe this is another reason why let-insertion is useful
-  ;; (but if the core of my language was ANF'd before any runtime,
-  ;; then maybe implicit lifting would be just as easy...)
-  (define (simple? stx)
-    (or (identifier? stx)
-        (number? (syntax-e stx))))
-  (define (bad-implicit-lift datum)
-    (error "implicit lift of non-simple:" datum))
+  ;; An needs to either produce a value or produce code. First, we run
+  ;; the arguments down to a list of values (which get passed as ops).
+  ;; But if those values are a mix of code/not code, then we do
+  ;; something like an implicit lift (the else case) for the non-code
+  ;; ones. That seems sketchy when side-effects get into the mix..
+  (define (call-or-code ops stxs)
+    (cond
+      [(andmap not-code? ops)
+       (match-define (cons rator rands) ops)
+       (if (liftable-proc? rator)
+           (apply rator rator rands)
+           (apply rator rands))]
+      [else
+       (define code-bodies
+         (for/list ([v ops]
+                    [stx (in-syntax stxs)])
+           (if (code? v)
+               (code-e v)
+               stx)))
+       (code #`(ud:app #,@code-bodies))]))
 
   (define-syntax (ud:app stx)
     (syntax-parse stx
-      [(_ e-op e-arg)
-       #`(match* (e-op e-arg)
-           [((? not-code? op) (code arg))
-            (unless (simple? #'e-op)
-              (bad-implicit-lift (syntax->datum #'e-op)))
-            (code #`(ud:app e-op #,arg))]
-           [((code op) (? not-code? arg))
-            (unless (simple? #'e-arg)
-              (bad-implicit-lift (syntax->datum #'e-arg)))
-            (code #`(ud:app #,op e-arg))]
-           [((code op) (code arg)) (code #`(ud:app #,op #,arg))]
-           [(v1 v2)
-            (if (liftable-proc? v1)
-                (#%app v1 v1 v2)
-                (#%app v1 v2))])]
       [(_ e ...)
-       #`(#%app e ...)]))
+       #`(call-or-code (list e ...) #'(e ...))]))
 
   (define-syntax-rule (ud:if0 e1 e2 e3)
     (match e1
-      [(code e) (code #`(ud:if0 #,e (void) (void)))]
+      [(code e)
+       (match* (e2 e3)
+         [((code e2*) (code e3*))
+          (code #`(ud:if0 #,e #,e2* #,e3*))]
+         [((? not-code? v) (code e3*))
+          (match (lift v)
+            [(code e2*)
+             (code #`(ud:if0 #,e #,e2* #,e3*))])]
+         [((code e2*) (? not-code? v))
+          (match (lift v)
+            [(code e3*)
+             (code #`(ud:if0 #,e #,e2* #,e3*))])]
+         [((? not-code? v2) (? not-code? v3))
+          (match* ((lift v2) (lift v3))
+            [((code e2*) (code e3*))
+             (code #`(ud:if0 #,e #,e2* #,e3*))])])]
       [(? zero? _) e2]
       [_ e3]))
 
   (define (fresh-var [name 'var]) (gensym name))
-  (define (lift v [mumble #f])
+  (define (lift v)
     (define v-exp
       (match v
         [(? number? v) #`(ud:datum . #,v)]
         [(liftable-proc proc rec arg body)
          (define rec-fresh (fresh-var (syntax-e rec)))
          (define arg-fresh (fresh-var (syntax-e arg)))
+
          #`(ud:lambda
             #,rec-fresh (#,arg-fresh)
-            #,(match (eval-code-exp #`((ud:lambda #,rec (#,arg) #,body)
-                                       #,(code rec-fresh) #,(code arg-fresh)))
-                [(code reduced-body) reduced-body]
-                [(? not-code? v) v]))]
+            #,(match (eval-code-exp #`((lambda (#,rec #,arg) #,body)
+                                       #,(code #`#,rec-fresh) #,(code #`#,arg-fresh)))
+                [(code reduced-body)
+                 (datum->syntax body reduced-body)]
+                [_
+                 (error
+                  'lift
+                  (string-append
+                   "Lifting a function evaluates its body, and that body "
+                   "must evaluate to code. Instead of code it was: ~a")
+                  v)]))]
         ;; What should happen if we lift an arbitrary function? Maybe
-        ;; we have to only allow lifting liftable-proc and primitive
-        ;; functions (e.g. add1)
+        ;; we have to special-case some functions, e.g. wrap add1
+        ;; in a liftable-proc
         ;; [(? procedure? p) ...]
         [(code e) #`(ud:lift #,e)]))
     (code v-exp))
   (define-syntax-rule (ud:lift e) (lift e))
 
-  (define (eval-code-exp e) (eval e (eval-namespace)))
+  (define print-eval? (make-parameter #f))
+  (define-syntax (trace-eval stx)
+    (syntax-parse stx
+      [(_ e ...+)
+       #`(parameterize ([print-eval? #t])
+           e ...)]))
+
+  (define (eval-code-exp e)
+    (when (print-eval?) (displayln (format "evaluating ~a" (syntax->datum e))))
+    (define result (eval e (eval-namespace)))
+    (when (print-eval?)
+      (match result
+        [(liftable-proc proc rec arg body)
+         (displayln (format "produced proc with body ~a" body))]
+        [(code body)
+         (displayln (format "produced code for ~a" (syntax->datum body)))]
+        [_ (displayln (format "produced ~a" result))]))
+    result)
   (define-syntax-rule (ud:run b e)
     (match b
       [(code b1)
@@ -133,11 +163,12 @@
     (syntax-parse stx
       [(_ forms ...+)
        #`(#%module-begin
-          ;; Avoid parameterize because I don't know a different way
-          ;; to work with printing-module-begin
+          ;; Avoid parameterize around the module body because I don't
+          ;; know a way for that to work w/printing-module-begin
           (let ([ns (make-base-empty-namespace)])
-            ;; Need the eval-namespace parameter to be shared (or
-            ;; something like that, see https://goo.gl/ihKPSH)
+            ;; Use namespace-attach-module because we need to share
+            ;; the eval-namespace parameter (or something like that,
+            ;; see https://goo.gl/ihKPSH)
             (namespace-attach-module (current-namespace)
                                      (quote-module-path ".." updown)
                                      ns)
@@ -163,16 +194,21 @@
   (check-equal? (if0 0 111 999) 111)
   (check-equal? (if0 1 9 400) 400)
   (check-code? (if0 (lift 5) 111 999))
+  (check-code? (+ (lift 1) 2))
 
   (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1)
 
   (check-equal? ((lambda _ (x) (add1 x)) 5) 6)
   (check-equal? (sub1 10) 9)
 
-  (check-code? (lift (lambda _ (x) (add1 11))))
-  (check-equal? ((run 0 (lift (lambda _ (x) (add1 11)))) 42)
-                12)
-  (check-code? (lift (lambda _ (x) (x 1))))
-  (check-equal? ((run 0 (lift (lambda _ (x) (x 41)))) (lambda _ (x) x)) 41)
-  (check-equal? ((run 0 (lift (lambda _ (x) (add1 x)))) 42)
-                43))
+  (check-equal? ((run 0 (lift (lambda _ (x) (x 41)))) add1)
+                42)
+
+  (check-equal? ((lambda sum (n) (if0 n n (+ n (sum (sub1 n))))) 5)
+                15)
+  (check-code? (lift (lambda sum (n) (if0 n n (+ n (sum (sub1 n)))))))
+  (check-equal? ((run 0 (lift (lambda sum (n) (if0 n n (+ n (sum (sub1 n))))))) 6)
+                21)
+
+  (check-equal? (run 0 (+ (lift 1) (lift 2))) 3)
+  (check-equal? (run 0 (if0 (lift 1) 10 11)) 11))
