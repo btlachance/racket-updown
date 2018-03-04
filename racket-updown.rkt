@@ -1,21 +1,12 @@
 #lang racket
-(module updown-util racket
-  (provide (struct-out code) not-code?)
-  (struct code (e) #:prefab)
-  (define not-code? (negate code?)))
-
 (module updown racket
-  (require (for-syntax syntax/parse (submod ".." updown-util))
-           (submod ".." updown-util)
+  (require (for-syntax syntax/parse racket/syntax)
            syntax/location
            rackunit)
   (provide #%top-interaction
+           trace-eval
            check-equal?
            check-code?
-           +
-           add1
-           sub1
-           trace-eval
            (rename-out [ud:module-begin #%module-begin]
                        [ud:lambda lambda]
                        [ud:app #%app]
@@ -24,112 +15,90 @@
                        [ud:lift lift]
                        [ud:run run]))
 
-
-  (define (liftable-proc-print lp port mode)
-    (match-define (liftable-proc _ rec arg body) lp)
-    (define result
-      (format
-       "<zliftable-proc ~a (~a) ~a>"
-       (syntax-e rec)
-       (syntax-e arg)
-       (syntax->datum body)))
-    (pretty-display result port #:newline? #f))
-  (struct liftable-proc (value rec arg body)
-    #:property prop:procedure (struct-field-index value)
+  (struct code (e)
     #:methods gen:custom-write
-    [(define write-proc liftable-proc-print)])
+    [(define (write-proc v port mode)
+       (pretty-display
+        (format
+         "(code ~a)"
+         (syntax->datum (code-e v)))
+        port
+        #:newline? #f))])
+  (define not-code? (negate code?))
 
+  (define-syntax (define-prims stx)
+    (syntax-parse stx
+      [(_ prim-name:id ...)
+       (define (make-prim-id id) (format-id id "ud:~a" id))
+       (with-syntax ([(ud:prim ...) (map make-prim-id (attribute prim-name))])
+         #`(begin
+             (define ud:prim (prim prim-name #'ud:prim)) ...
+             (provide (rename-out [ud:prim prim-name] ...))))]))
+  (struct prim (proc id)
+    #:property prop:procedure (struct-field-index proc))
+  (define-prims + add1 sub1)
 
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
       [(_ rec:id (x:id) e:expr)
-       #`(liftable-proc
-          (lambda (rec x) e)
-          #'rec
-          #'x
-          #'e)]))
+       #`(liftable-proc (lambda (rec x) e) #'rec #'x #'e)]))
+  (struct liftable-proc (value rec arg body)
+    #:property prop:procedure (struct-field-index value))
 
   (define-syntax (ud:datum stx)
     (syntax-parse stx
       [(_ . d:number) #`(#%datum . d)]))
 
-  ;; An needs to either produce a value or produce code. First, we run
-  ;; the arguments down to a list of values (which get passed as ops).
-  ;; But if those values are a mix of code/not code, then we do
-  ;; something like an implicit lift (the else case) for the non-code
-  ;; ones. That seems sketchy when side-effects get into the mix..
-  (define (call-or-code ops stxs)
-    (cond
-      [(andmap not-code? ops)
-       (match-define (cons rator rands) ops)
-       (if (liftable-proc? rator)
-           (apply rator rator rands)
-           (apply rator rands))]
-      [else
-       (define code-bodies
-         (for/list ([v ops]
-                    [stx (in-syntax stxs)])
-           (if (code? v)
-               (code-e v)
-               stx)))
-       (code #`(ud:app #,@code-bodies))]))
-
   (define-syntax (ud:app stx)
     (syntax-parse stx
       [(_ e ...)
        #`(call-or-code (list e ...) #'(e ...))]))
+  ;; App needs to either produce a value or produce code. First, we
+  ;; run the arguments down to a list of values (which gets bound to
+  ;; args). We implicitly lift primitive functions, but I'm not sure
+  ;; if that's the right thing to do---what if it was an effectful
+  ;; operation that evaluated to a prim?---maybe they should have to
+  ;; be explicitly lifted.
+  (define (call-or-code args stxs)
+    (match* ((car args) (cdr args))
+      [((? liftable-proc? rator)
+        (list (? not-code? rands) ...))
+       (apply rator rator rands)]
+
+      [((prim rator _)
+        (list (? not-code? rands) ...))
+       (apply rator rands)]
+
+      [((or (prim _ e-rator) (code e-rator))
+        (list (code e-rands) ...))
+       (code #`(ud:app #,e-rator #,@e-rands))]))
 
   (define-syntax-rule (ud:if0 e1 e2 e3)
     (match e1
       [(code e)
        (match* (e2 e3)
          [((code e2*) (code e3*))
-          (code #`(ud:if0 #,e #,e2* #,e3*))]
-         [((? not-code? v) (code e3*))
-          (match (lift v)
-            [(code e2*)
-             (code #`(ud:if0 #,e #,e2* #,e3*))])]
-         [((code e2*) (? not-code? v))
-          (match (lift v)
-            [(code e3*)
-             (code #`(ud:if0 #,e #,e2* #,e3*))])]
-         [((? not-code? v2) (? not-code? v3))
-          (match* ((lift v2) (lift v3))
-            [((code e2*) (code e3*))
-             (code #`(ud:if0 #,e #,e2* #,e3*))])])]
-      [(? zero? _) e2]
+          (code #`(ud:if0 #,e #,e2* #,e3*))])]
+      [0 e2]
       [_ e3]))
 
-  (define (fresh-var [name 'var]) (gensym name))
+  (define-syntax-rule (ud:lift e) (lift e))
   (define (lift v)
     (define v-exp
       (match v
         [(? number? v) #`(ud:datum . #,v)]
-        [(liftable-proc proc rec arg body)
-         (define rec-fresh (fresh-var (syntax-e rec)))
-         (define arg-fresh (fresh-var (syntax-e arg)))
+        [(liftable-proc proc rec arg _)
+         (define rec-fresh (datum->syntax #'rec (syntax-e rec)))
+         (define arg-fresh (datum->syntax #'arg (gensym (syntax-e arg))))
 
-         #`(ud:lambda
-            #,rec-fresh (#,arg-fresh)
-            #,(match (eval-code-exp #`((lambda (#,rec #,arg) #,body)
-                                       #,(code #`#,rec-fresh) #,(code #`#,arg-fresh)))
-                [(code reduced-body)
-                 (datum->syntax body reduced-body)]
-                [_
-                 (error
-                  'lift
-                  (string-append
-                   "Lifting a function evaluates its body, and that body "
-                   "must evaluate to code. Instead of code it was: ~a")
-                  v)]))]
-        ;; What should happen if we lift an arbitrary function? Maybe
-        ;; we have to special-case some functions, e.g. wrap add1
-        ;; in a liftable-proc
-        ;; [(? procedure? p) ...]
-        [(code e) #`(ud:lift #,e)]))
+         (match (proc (code rec-fresh) (code arg-fresh))
+           [(code e)
+            #`(ud:lambda
+               #,rec-fresh (#,arg-fresh)
+               #,e)])]
+         [(prim _ id) id]
+         [(code e) #`(ud:lift #,e)]))
     (code v-exp))
-  (define-syntax-rule (ud:lift e) (lift e))
-
   (define print-eval? (make-parameter #f))
   (define-syntax (trace-eval stx)
     (syntax-parse stx
@@ -179,36 +148,50 @@
               (namespace-require (quote-module-path ".." updown)))
             (eval-namespace ns))
           forms ...)]))
-
   (define-syntax-rule (check-code? e)
     (check-pred code? e)))
 
 (module test (submod ".." updown)
+  ;; Datum can be lifted/run
   (check-code? (lift (add1 1)))
   (check-equal? (run 0 (lift (add1 1))) 2)
 
-  (check-equal? (run 0 (lift 5)) 5)
+
+  ;; Run produces code when the first arg is code
   (check-code? (run (lift 1) (lift 5)))
   (check-equal? (run 0 (run (lift 1) (lift (lift 11)))) 11)
 
+
+  ;; if0 does the right thing on non-code and code
   (check-equal? (if0 0 111 999) 111)
   (check-equal? (if0 1 9 400) 400)
-  (check-code? (if0 (lift 5) 111 999))
-  (check-code? (+ (lift 1) 2))
+  (check-code? (if0 (lift 5) (lift 111) (lift 999)))
+  (check-equal? (run 0 (if0 (lift 1) (lift 10) (lift 11))) 11)
 
+
+  ;; Lambdas and primitive operators do the right thing on non-code
   (check-equal? (((lambda _ (x) (lambda _ (y) x)) 1) 404) 1)
-
   (check-equal? ((lambda _ (x) (add1 x)) 5) 6)
   (check-equal? (sub1 10) 9)
 
-  (check-equal? ((run 0 (lift (lambda _ (x) (x 41)))) add1)
-                42)
+
+  ;; Primitive operators produce code when giving code arguments (and
+  ;; they can also be lifted)
+  (check-equal? (run 0 (+ (lift 1) (lift 2))) 3)
+  (check-equal? (run 0 ((lift +) (lift 1) (lift 2))) 3)
+
 
   (check-equal? ((lambda sum (n) (if0 n n (+ n (sum (sub1 n))))) 5)
                 15)
-  (check-code? (lift (lambda sum (n) (if0 n n (+ n (sum (sub1 n)))))))
+  ;; Lambdas do the right thing when lifted/run
+  (check-equal? ((run 0 (lift (lambda _ (x) (x (lift 41))))) add1)
+                42)
   (check-equal? ((run 0 (lift (lambda sum (n) (if0 n n (+ n (sum (sub1 n))))))) 6)
                 21)
 
-  (check-equal? (run 0 (+ (lift 1) (lift 2))) 3)
-  (check-equal? (run 0 (if0 (lift 1) 10 11)) 11))
+
+  ;; Make sure that lambdas inside a lifted function can close over
+  ;; arguments to the lifted function.
+  (check-equal?
+   (((run 0 (lift (lambda _ (x) (if0 x x (lift (lambda _ (y) x)))))) 42) 0)
+   42))
