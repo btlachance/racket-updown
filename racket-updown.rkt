@@ -41,8 +41,18 @@
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
       [(_ rec:id (x:id) e:expr)
-       #`(liftable-proc (lambda (rec x) e) #'rec #'x #'e)]))
-  (struct liftable-proc (value rec arg body)
+       (with-syntax ([raw-rec (format-id #'rec "raw-~a" #'rec)])
+         ;; A bit of a mess but it lets us use the normal Racket
+         ;; calling convention and still replace the self-reference
+         ;; with code
+         #`(letrec ([raw-rec (lambda (rec x) e)]
+                    [rec (liftable-proc
+                          (procedure-rename
+                           (lambda (x) (raw-rec rec x))
+                           'rec)
+                          raw-rec #'rec #'x #'e)])
+             rec))]))
+  (struct liftable-proc (value raw-value rec arg body)
     #:property prop:procedure (struct-field-index value))
 
   (define-syntax (ud:datum stx)
@@ -52,6 +62,8 @@
   (define-syntax (ud:app stx)
     (syntax-parse stx
       [(_ e ...)
+       ;; TODO Ditch call-or-code (and thus apply) by compiling to
+       ;; match*/case dispatch/function applications here
        #`(call-or-code (list e ...) #'(e ...))]))
   ;; App needs to either produce a value or produce code. First, we
   ;; run the arguments down to a list of values (which gets bound to
@@ -61,17 +73,13 @@
   ;; be explicitly lifted.
   (define (call-or-code args stxs)
     (match* ((car args) (cdr args))
-      [((? liftable-proc? rator)
-        (list (? not-code? rands) ...))
-       (apply rator rator rands)]
-
-      [((prim rator _)
-        (list (? not-code? rands) ...))
-       (apply rator rands)]
-
       [((or (prim _ e-rator) (code e-rator))
         (list (code e-rands) ...))
-       (code #`(ud:app #,e-rator #,@e-rands))]))
+       (code #`(ud:app #,e-rator #,@e-rands))]
+
+      [((or (prim rator _) (? liftable-proc? rator))
+        (list rands ...))
+       (apply rator rands)]))
 
   (define-syntax-rule (ud:if0 e1 e2 e3)
     (match e1
@@ -87,11 +95,11 @@
     (define v-exp
       (match v
         [(? number? v) #`(ud:datum . #,v)]
-        [(liftable-proc proc rec arg _)
+        [(liftable-proc proc raw-proc rec arg _)
          (define rec-fresh (datum->syntax #'rec (syntax-e rec)))
          (define arg-fresh (datum->syntax #'arg (gensym (syntax-e arg))))
 
-         (match (proc (code rec-fresh) (code arg-fresh))
+         (match (raw-proc (code rec-fresh) (code arg-fresh))
            [(code e)
             #`(ud:lambda
                #,rec-fresh (#,arg-fresh)
@@ -111,8 +119,8 @@
     (define result (eval e (eval-namespace)))
     (when (print-eval?)
       (match result
-        [(liftable-proc proc rec arg body)
-         (displayln (format "produced proc with body ~a" body))]
+        [(? liftable-proc? p)
+         (displayln (format "produced proc with body ~a" (syntax->datum (liftable-proc-body p))))]
         [(code body)
          (displayln (format "produced code for ~a" (syntax->datum body)))]
         [_ (displayln (format "produced ~a" result))]))
