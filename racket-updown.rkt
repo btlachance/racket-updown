@@ -1,29 +1,30 @@
 #lang racket
 (module updown racket
   (require (for-syntax syntax/parse racket/syntax)
+           racket/struct
            syntax/location
            rackunit)
   (provide #%top-interaction
            trace-eval
            check-equal?
+           check-true
            check-code?
+           quote
            (rename-out [ud:module-begin #%module-begin]
                        [ud:lambda lambda]
                        [ud:app #%app]
                        [ud:datum #%datum]
                        [ud:if0 if0]
+                       [ud:if if]
                        [ud:lift lift]
                        [ud:run run]))
 
   (struct code (e)
     #:methods gen:custom-write
-    [(define (write-proc v port mode)
-       (pretty-display
-        (format
-         "(code ~a)"
-         (syntax->datum (code-e v)))
-        port
-        #:newline? #f))])
+    [(define write-proc
+       (make-constructor-style-printer
+        (lambda (c) 'code)
+        (lambda (c) (list (syntax->datum (code-e c))))))])
   (define not-code? (negate code?))
 
   (define-syntax (define-prims stx)
@@ -36,7 +37,7 @@
              (provide (rename-out [ud:prim prim-name] ...))))]))
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
-  (define-prims + add1 sub1)
+  (define-prims + add1 sub1 cons car cdr null? zero? equal?)
 
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
@@ -57,7 +58,10 @@
 
   (define-syntax (ud:datum stx)
     (syntax-parse stx
-      [(_ . d:number) #`(#%datum . d)]))
+      [(_ . d:boolean) #`(#%datum . d)]
+      [(_ . d:number) #`(#%datum . d)]
+      [(_ . d:id) #`(#%datum . d)]
+      [(_ a . b) #`(#%datum a . b)]))
 
   (define-syntax (ud:app stx)
     (syntax-parse stx
@@ -81,20 +85,28 @@
         (list rands ...))
        (apply rator rands)]))
 
-  (define-syntax-rule (ud:if0 e1 e2 e3)
+  (define-syntax-rule (ud:if e1 e2 e3)
     (match e1
       [(code e)
        (match* (e2 e3)
          [((code e2*) (code e3*))
-          (code #`(ud:if0 #,e #,e2* #,e3*))])]
-      [0 e2]
-      [_ e3]))
+          (code #`(ud:if #,e #,e2* #,e3*))])]
+      [#f e3]
+      [_ e2]))
+  (define-syntax-rule (ud:if0 e1 e2 e3)
+    ;; Tricky: need to expand to ud:app/ud:zero?
+    (ud:if (ud:app ud:zero? e1) e2 e3))
 
   (define-syntax-rule (ud:lift e) (lift e))
   (define (lift v)
     (define v-exp
       (match v
-        [(? number? v) #`(ud:datum . #,v)]
+        ;; Not clear if we should be traversing v in some way---before
+        ;; I added booleans to ud:datum, I was able to lift '(#t)
+        [(? boolean? b) #`(ud:datum . #,b)]
+        [(cons a b) #`(ud:datum #,a . #,b)]
+        [(? number? n) #`(ud:datum . #,n)]
+        [(? symbol? s) #`(ud:datum . #,s)]
         [(liftable-proc proc raw-proc rec arg _)
          (define rec-fresh (datum->syntax #'rec (syntax-e rec)))
          (define arg-fresh (datum->syntax #'arg (gensym (syntax-e arg))))
@@ -115,12 +127,15 @@
            e ...)]))
 
   (define (eval-code-exp e)
-    (when (print-eval?) (displayln (format "evaluating ~a" (syntax->datum e))))
+    ;; (when (print-eval?)
+    ;;   (pretty-display "evaluating ")
+    ;;   (pretty-print (syntax->datum e)))
     (define result (eval e (eval-namespace)))
     (when (print-eval?)
       (match result
         [(? liftable-proc? p)
-         (displayln (format "produced proc with body ~a" (syntax->datum (liftable-proc-body p))))]
+         (pretty-display "produced proc with body ")
+         (pretty-print (syntax->datum (liftable-proc-body p)))]
         [(code body)
          (displayln (format "produced code for ~a" (syntax->datum body)))]
         [_ (displayln (format "produced ~a" result))]))
@@ -202,4 +217,51 @@
   ;; arguments to the lifted function.
   (check-equal?
    (((run 0 (lift (lambda _ (x) (if0 x x (lift (lambda _ (y) x)))))) 42) 0)
-   42))
+   42)
+
+  (check-code? (lift '(1 . 2)))
+  (check-equal? (run 0 (lift '(1 . 2))) '(1 . 2))
+  (check-code? (lift '(1 2)))
+  (check-equal? (run 0 (lift (cons 1 (cons 2 '())))) '(1 2))
+
+  (check-code? (lift 'a))
+  (check-equal? (run 0 (lift 'a)) 'a)
+  (check-equal? (run 0 (lift '((a 1) (b 2) (c 3)))) '((a 1) (b 2) (c 3)))
+
+  (check-code? (lift #t))
+  (check-equal? (run 0 (lift #f)) #f)
+  (check-equal? (run 0 (lift '(#t #f))) '(#t #f))
+
+  ;; This is the tiny matcher from the paper.
+  (check-true
+   (((lambda matches? (r)
+             (lambda _ (s) (if (null? r)
+                               #t
+                               (if (null? s)
+                                   #f
+                                   (if (equal? (car r) (car s))
+                                       ((matches? (cdr r)) (cdr s))
+                                       #f)))))
+     '(a b))
+    '(a b c)))
+
+  (check-true
+   ((run
+     0
+     ;; This is the paper's lift-ready matcher. If you forget to lift
+     ;; any of these places, the error messages are unpleasant.
+     ;;
+     ;; I don't yet do any let insertion, so if you trace-eval you see
+     ;; cdr applied to to s twice in the resulting code:
+     ;; - once for (null? (cdr s))
+     ;; - once for (car (cdr s))
+     (lift ((lambda matches? (r)
+                    (lambda _ (s) (if (null? r)
+                                      (lift #t)
+                                      (if (null? s)
+                                          (lift #f)
+                                          (if (equal? (lift (car r)) (car s))
+                                              ((matches? (cdr r)) (cdr s))
+                                              (lift #f))))))
+            '(a b))))
+    '(a b c))))
