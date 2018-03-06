@@ -35,9 +35,12 @@
          #`(begin
              (define ud:prim (prim prim-name #'ud:prim)) ...
              (provide (rename-out [ud:prim prim-name] ...))))]))
+  ;; a prim is a function that, when applied to code arguments,
+  ;; produces code for applying the prim to the contents of the code
+  ;; arguments
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
-  (define-prims + add1 sub1 cons car cdr null? zero? equal?)
+  (define-prims + add1 sub1 cons car cdr null? zero? equal? eq?)
 
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
@@ -61,6 +64,7 @@
       [(_ . d:boolean) #`(#%datum . d)]
       [(_ . d:number) #`(#%datum . d)]
       [(_ . d:id) #`(#%datum . d)]
+      [(_) #`(#%datum)]
       [(_ a . b) #`(#%datum a . b)]))
 
   (define-syntax (ud:app stx)
@@ -102,13 +106,16 @@
     (define v-exp
       (match v
         ;; Not clear if we should be traversing v in some way---before
-        ;; I added booleans to ud:datum, I was able to lift '(#t)
+        ;; I added booleans to ud:datum, I was able to lift '(#t). And
+        ;; lifting cons like this is going to be buggy when there's
+        ;; e.g. a function or code in the cons cell.
         [(? boolean? b) #`(ud:datum . #,b)]
         [(cons a b) #`(ud:datum #,a . #,b)]
         [(? number? n) #`(ud:datum . #,n)]
         [(? symbol? s) #`(ud:datum . #,s)]
+        [(? null? s) #`(ud:datum)]
         [(liftable-proc proc raw-proc rec arg _)
-         (define rec-fresh (datum->syntax #'rec (syntax-e rec)))
+         (define rec-fresh (datum->syntax #'rec (gensym (syntax-e rec))))
          (define arg-fresh (datum->syntax #'arg (gensym (syntax-e arg))))
 
          (match (raw-proc (code rec-fresh) (code arg-fresh))
@@ -127,9 +134,9 @@
            e ...)]))
 
   (define (eval-code-exp e)
-    ;; (when (print-eval?)
-    ;;   (pretty-display "evaluating ")
-    ;;   (pretty-print (syntax->datum e)))
+    (when (print-eval?)
+      (pretty-display "evaluating ")
+      (pretty-print (syntax->datum e)))
     (define result (eval e (eval-namespace)))
     (when (print-eval?)
       (match result
@@ -239,7 +246,7 @@
                                #t
                                (if (null? s)
                                    #f
-                                   (if (equal? (car r) (car s))
+                                   (if (eq? (car r) (car s))
                                        ((matches? (cdr r)) (cdr s))
                                        #f)))))
      '(a b))
@@ -260,7 +267,7 @@
                                       (lift #t)
                                       (if (null? s)
                                           (lift #f)
-                                          (if (equal? (lift (car r)) (car s))
+                                          (if (eq? (lift (car r)) (car s))
                                               ((matches? (cdr r)) (cdr s))
                                               (lift #f))))))
             '(a b))))
