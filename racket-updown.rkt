@@ -1,6 +1,6 @@
 #lang racket
 (module updown racket
-  (require (for-syntax syntax/parse racket/syntax)
+  (require (for-syntax syntax/parse racket/syntax racket/match racket/pretty)
            racket/struct
            syntax/location
            rackunit)
@@ -45,19 +45,19 @@
 
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
-      [(_ rec:id (x:id) e:expr)
+      [(_ rec:id (x:id ...) e:expr)
        (with-syntax ([raw-rec (format-id #'rec "raw-~a" #'rec)])
          ;; A bit of a mess but it lets us use the normal Racket
          ;; calling convention and still replace the self-reference
          ;; with code
-         #`(letrec ([raw-rec (lambda (rec x) e)]
+         #`(letrec ([raw-rec (lambda (rec x ...) e)]
                     [rec (liftable-proc
                           (procedure-rename
-                           (lambda (x) (raw-rec rec x))
+                           (lambda (x ...) (raw-rec rec x ...))
                            'rec)
-                          raw-rec #'rec #'x #'e)])
+                          raw-rec #'rec (syntax->list #'(x ...)) #'e)])
              rec))]))
-  (struct liftable-proc (value raw-value rec arg body)
+  (struct liftable-proc (value raw-value rec args body)
     #:property prop:procedure (struct-field-index value))
 
   (define-syntax (ud:datum stx)
@@ -115,14 +115,15 @@
         [(? number? n) #`(ud:datum . #,n)]
         [(? symbol? s) #`(ud:datum . #,s)]
         [(? null? s) #`(ud:datum)]
-        [(liftable-proc proc raw-proc rec arg _)
-         (define rec-fresh (datum->syntax #'rec (gensym (syntax-e rec))))
-         (define arg-fresh (datum->syntax #'arg (gensym (syntax-e arg))))
+        [(liftable-proc proc raw-proc rec args _)
+         (define rec-fresh (datum->syntax rec (gensym (syntax-e rec))))
+         (define args-fresh
+           (for/list ([arg args]) (datum->syntax arg (gensym (syntax-e arg)))))
 
-         (match (raw-proc (code rec-fresh) (code arg-fresh))
+         (match (apply raw-proc (code rec-fresh) (for/list ([a-f args-fresh]) (code a-f)))
            [(code e)
             #`(ud:lambda
-               #,rec-fresh (#,arg-fresh)
+               #,rec-fresh (#,@args-fresh)
                #,e)])]
          [(prim _ id) id]
          [(code e) #`(ud:lift #,e)]))
@@ -159,34 +160,41 @@
          [(code e-code) (eval-code-exp e-code)])]))
 
   (define-syntax (ud:define stx)
-    ;; a curried-arg-list is one of
-    ;; symbol
-    ;; ((curried-arg-list) symbol)
+    (let ([error-msg/#f
+           (match (syntax-local-context)
+             ['expression "Definitions in expression contexts are not allowed"]
+             [(cons _ _) "Internal definitions are not allowed"]
+             [_ #f])])
+      (when error-msg/#f (raise-syntax-error #f error-msg/#f stx)))
+
     (define-syntax-class curried-function-signature/rev
-      #:attributes [fname ids-rev]
-      (pattern (fname:id arg:id)
-               #:attr ids-rev (list #'arg))
-      (pattern (sub:curried-function-signature/rev arg:id)
+      #:attributes [fname idss-rev]
+      (pattern (fname:id arg:id ...)
+               #:attr idss-rev (list (attribute arg)))
+      (pattern (sub:curried-function-signature/rev arg:id ...)
                #:attr fname (attribute sub.fname)
-               #:attr ids-rev (cons #'arg (attribute sub.ids-rev))))
+               #:attr idss-rev (cons (attribute arg) (attribute sub.idss-rev))))
     (define-syntax-class curried-function-signature
-      #:attributes [fname ids]
+      #:attributes [fname idss]
       (pattern :curried-function-signature/rev
-               #:attr ids (reverse (attribute ids-rev))))
+               #:attr idss (reverse (attribute idss-rev))))
+
     (syntax-parse stx
       [(_ sig:curried-function-signature e)
        ;; I only want define at a module body for now, and this should
        ;; be a hacky way to raise *some* error if define is used
        ;; outside of that..
-       #`(define-values (sig.fname)
+       #`(define sig.fname
            (ud:lambda
-            sig.fname (#,(car (attribute sig.ids)))
-            #,(let loop ([ids (cdr (attribute sig.ids))])
-                (if (null? ids)
+            ;; Maybe we drop the self-reference from ud:lambda now
+            ;; that we have define.
+            sig.fname (#,@(car (attribute sig.idss)))
+            #,(let loop ([idss (cdr (attribute sig.idss))])
+                (if (null? idss)
                     #'e
                     #`(ud:lambda
-                       _ (#,(car ids))
-                       #,(loop (cdr ids)))))))]))
+                       _ (#,@(car idss))
+                       #,(loop (cdr idss)))))))]))
 
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
@@ -296,4 +304,10 @@
             (if (eq? (lift (car r)) (car s))
                 ((matches?-spec (cdr r)) (cdr s))
                 (lift #f)))))
-  (check-true ((run 0 (lift (matches?-spec '(a b)))) '(a b c))))
+  (check-true ((run 0 (lift (matches?-spec '(a b)))) '(a b c)))
+
+  ;; More than just unary functions
+  (define (k-#t) (super-equal? 10 10))
+  (define (super-equal? x y) (equal? (equal? x y) (equal? y x)))
+  (check-true (k-#t))
+  (check-code? (lift super-equal?)))
