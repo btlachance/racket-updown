@@ -17,7 +17,8 @@
                        [ud:if0 if0]
                        [ud:if if]
                        [ud:lift lift]
-                       [ud:run run]))
+                       [ud:run run]
+                       [ud:define define]))
 
   (struct code (e)
     #:methods gen:custom-write
@@ -157,6 +158,36 @@
        (match e
          [(code e-code) (eval-code-exp e-code)])]))
 
+  (define-syntax (ud:define stx)
+    ;; a curried-arg-list is one of
+    ;; symbol
+    ;; ((curried-arg-list) symbol)
+    (define-syntax-class curried-function-signature/rev
+      #:attributes [fname ids-rev]
+      (pattern (fname:id arg:id)
+               #:attr ids-rev (list #'arg))
+      (pattern (sub:curried-function-signature/rev arg:id)
+               #:attr fname (attribute sub.fname)
+               #:attr ids-rev (cons #'arg (attribute sub.ids-rev))))
+    (define-syntax-class curried-function-signature
+      #:attributes [fname ids]
+      (pattern :curried-function-signature/rev
+               #:attr ids (reverse (attribute ids-rev))))
+    (syntax-parse stx
+      [(_ sig:curried-function-signature e)
+       ;; I only want define at a module body for now, and this should
+       ;; be a hacky way to raise *some* error if define is used
+       ;; outside of that..
+       #`(define-values (sig.fname)
+           (ud:lambda
+            sig.fname (#,(car (attribute sig.ids)))
+            #,(let loop ([ids (cdr (attribute sig.ids))])
+                (if (null? ids)
+                    #'e
+                    #`(ud:lambda
+                       _ (#,(car ids))
+                       #,(loop (cdr ids)))))))]))
+
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
     (syntax-parse stx
@@ -240,35 +271,29 @@
   (check-equal? (run 0 (lift '(#t #f))) '(#t #f))
 
   ;; This is the tiny matcher from the paper.
-  (check-true
-   (((lambda matches? (r)
-             (lambda _ (s) (if (null? r)
-                               #t
-                               (if (null? s)
-                                   #f
-                                   (if (eq? (car r) (car s))
-                                       ((matches? (cdr r)) (cdr s))
-                                       #f)))))
-     '(a b))
-    '(a b c)))
+  (define ((matches? r) s)
+    (if (null? r)
+        #t
+        (if (null? s)
+            #f
+            (if (eq? (car r) (car s))
+                ((matches? (cdr r)) (cdr s))
+                #f))))
+  (check-true ((matches? '(a b)) '(a b c)))
 
-  (check-true
-   ((run
-     0
-     ;; This is the paper's lift-ready matcher. If you forget to lift
-     ;; any of these places, the error messages are unpleasant.
-     ;;
-     ;; I don't yet do any let insertion, so if you trace-eval you see
-     ;; cdr applied to to s twice in the resulting code:
-     ;; - once for (null? (cdr s))
-     ;; - once for (car (cdr s))
-     (lift ((lambda matches? (r)
-                    (lambda _ (s) (if (null? r)
-                                      (lift #t)
-                                      (if (null? s)
-                                          (lift #f)
-                                          (if (eq? (lift (car r)) (car s))
-                                              ((matches? (cdr r)) (cdr s))
-                                              (lift #f))))))
-            '(a b))))
-    '(a b c))))
+  ;; This is the paper's lift-ready matcher. If you forget to lift any
+  ;; of these places, the error messages are unpleasant.
+  ;;
+  ;; I don't yet do any let insertion, so if you trace-eval you see
+  ;; cdr applied to to s twice in the resulting code:
+  ;; - once for (null? (cdr s))
+  ;; - once for (car (cdr s))
+  (define ((matches?-spec r) s)
+    (if (null? r)
+        (lift #t)
+        (if (null? s)
+            (lift #f)
+            (if (eq? (lift (car r)) (car s))
+                ((matches?-spec (cdr r)) (cdr s))
+                (lift #f)))))
+  (check-true ((run 0 (lift (matches?-spec '(a b)))) '(a b c))))
