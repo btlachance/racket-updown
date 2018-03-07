@@ -44,7 +44,7 @@
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
   (define-prims #:id?-name prim-id?
-    + add1 sub1 cons car cdr null? zero? equal? eq?)
+    + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number?)
 
 
   ;; A hack so we can print code values (i.e. stx for expressions) in
@@ -347,3 +347,53 @@
   (define (super-equal? x y) (equal? (equal? x y) (equal? y x)))
   (check-true (k-#t))
   (check-code? (lift super-equal?)))
+
+;; A small-step abstract machine for a very simple language. What does
+;; it take to add lift to it?
+(module smallstep (submod ".." updown)
+  ;; e is one of
+  ;; - n
+  ;; - `(add1 ,e)
+  (define (add? e)
+    (if (pair? e)
+        (eq? (car e) 'add1)
+        #f))
+  (define (add-e e) (cadr e))
+
+  ;; k is one of
+  ;; - 'done
+  ;; - `(inc . ,k)
+
+  (define (inc k) (cons 'inc k))
+  (define (inc? k) (if (pair? k)
+                       (eq? (car k) 'inc)
+                       #f))
+  (define (inc-next k) (cdr k))
+
+  (define (state e k) (cons e k))
+  (define (state-e s) (car s))
+  (define (state-k s) (cdr s))
+  (define (final-state? state)
+    (if (eq? (cdr state) 'done)
+        (number? (car state))
+        #f))
+
+  (define (step e k)
+    (if (add? e)
+        (state (add-e e) (inc k))
+        (continue e k)))
+
+   (define (continue n k)
+     (if (inc? k)
+         (continue (add1 n) (inc-next k))
+         (state n k)))
+
+   (define (run e)
+     ((lambda run* (s)
+              (if (final-state? s)
+                  (state-e s)
+                  (run* (step (state-e s) (state-k s)))))
+      (state e 'done)))
+
+   (check-equal? (run 5) 5)
+   (check-equal? (run '(add1 (add1 (add1 3)))) 6))
