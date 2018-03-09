@@ -3,7 +3,6 @@
   (require (for-syntax syntax/parse racket/syntax racket/match racket/pretty)
            syntax/parse
            racket/struct
-           syntax/location
            rackunit)
   (provide #%top-interaction
            trace-eval
@@ -44,7 +43,7 @@
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
   (define-prims #:id?-name prim-id?
-    + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number?)
+    + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number? println)
 
 
   ;; A hack so we can print code values (i.e. stx for expressions) in
@@ -131,7 +130,17 @@
       [(code e)
        (match* (e2 e3)
          [((code e2*) (code e3*))
-          (code #`(ud:if #,e #,e2* #,e3*))])]
+          (code #`(ud:if #,e #,e2* #,e3*))]
+         [(v2 v3)
+          (raise-arguments-error
+           'lift
+           "Expected both branches of an if expression to produce code"
+           "test" (syntax->datum #'e1)
+           "produced code" (syntax->datum e)
+           "then branch" (syntax->datum #'e2)
+           "produced" v2
+           "else branch" (syntax->datum #'e3)
+           "produced" v3)])]
       [#f e3]
       [_ e2]))
   (define-syntax-rule (ud:if0 e1 e2 e3)
@@ -232,27 +241,24 @@
                        _ (#,@(car idss))
                        #,(loop (cdr idss)))))))]))
 
+  (define reference-for-eval (#%variable-reference))
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
     (syntax-parse stx
       [(_ forms ...+)
-       #`(#%module-begin
-          ;; Avoid parameterize around the module body because I don't
-          ;; know a way for that to work w/printing-module-begin
-          (let ([ns (make-base-empty-namespace)])
-            ;; Use namespace-attach-module because we need to share
-            ;; the eval-namespace parameter (or something like that,
-            ;; see https://goo.gl/ihKPSH)
-            (namespace-attach-module (current-namespace)
-                                     (quote-module-path ".." updown)
-                                     ns)
-            (parameterize ([current-namespace ns])
-              ;; How to properly refer to the updown module? IDK, but
-              ;; maybe that will be easier once it has a/is an
-              ;; installed collection
-              (namespace-require (quote-module-path ".." updown)))
-            (eval-namespace ns))
-          forms ...)]))
+         #`(#%module-begin
+            (define updown-mp (variable-reference->resolved-module-path reference-for-eval))
+            ;; Avoid parameterize around the module body because I don't
+            ;; know a way for that to work w/printing-module-begin
+            (let ([ns (make-base-empty-namespace)])
+              ;; Use namespace-attach-module because we need to share
+              ;; the eval-namespace parameter (or something like that,
+              ;; see https://goo.gl/ihKPSH)
+              (namespace-attach-module (current-namespace) updown-mp ns)
+              (parameterize ([current-namespace ns])
+                (namespace-require updown-mp))
+              (eval-namespace ns))
+            forms ...)]))
   (define-syntax-rule (check-code? e)
     (check-pred code? e)))
 
@@ -347,53 +353,3 @@
   (define (super-equal? x y) (equal? (equal? x y) (equal? y x)))
   (check-true (k-#t))
   (check-code? (lift super-equal?)))
-
-;; A small-step abstract machine for a very simple language. What does
-;; it take to add lift to it?
-(module smallstep (submod ".." updown)
-  ;; e is one of
-  ;; - n
-  ;; - `(add1 ,e)
-  (define (add? e)
-    (if (pair? e)
-        (eq? (car e) 'add1)
-        #f))
-  (define (add-e e) (cadr e))
-
-  ;; k is one of
-  ;; - 'done
-  ;; - `(inc . ,k)
-
-  (define (inc k) (cons 'inc k))
-  (define (inc? k) (if (pair? k)
-                       (eq? (car k) 'inc)
-                       #f))
-  (define (inc-next k) (cdr k))
-
-  (define (state e k) (cons e k))
-  (define (state-e s) (car s))
-  (define (state-k s) (cdr s))
-  (define (final-state? state)
-    (if (eq? (cdr state) 'done)
-        (number? (car state))
-        #f))
-
-  (define (step e k)
-    (if (add? e)
-        (state (add-e e) (inc k))
-        (continue e k)))
-
-   (define (continue n k)
-     (if (inc? k)
-         (continue (add1 n) (inc-next k))
-         (state n k)))
-
-   (define (run e)
-     ((lambda run* (s)
-              (if (final-state? s)
-                  (state-e s)
-                  (run* (step (state-e s) (state-k s)))))
-      (state e 'done)))
-
-   (check-equal? (run 5) 5)
-   (check-equal? (run '(add1 (add1 (add1 3)))) 6))
