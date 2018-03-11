@@ -30,11 +30,20 @@
 
   (define-syntax (define-prims stx)
     (syntax-parse stx
-      [(_ #:id?-name id? prim-name:id ...)
+      [(_ #:id?/name id? #:id->user-sym/name id->user-sym prim-name:id ...)
        (define (make-prim-id id) (format-id id "ud:~a" id))
        (with-syntax ([(ud:prim ...) (map make-prim-id (attribute prim-name))])
          #`(begin
-             (define (id? id) (member id (list #'prim-name ...) free-identifier=?))
+             (define (id? id) (member id (list #'ud:prim ...) free-identifier=?))
+             ;; Unfortunately, the nominal-source-id from calling
+             ;; identifier-bindings with a prim identifier x
+             ;; (i.e. (id? x) is true) was the ud:prim form and not
+             ;; the prim-name form. So instead we have to build our
+             ;; own approximation of what identifier-bindings does
+             (define (id->user-sym prim-id)
+               (define syms `((,#'ud:prim ,'prim-name) ...))
+               (match (assoc prim-id syms free-identifier=?)
+                 [(list _ user-sym) user-sym]))
              (define ud:prim (prim prim-name #'ud:prim)) ...
              (provide (rename-out [ud:prim prim-name] ...))))]))
   ;; a prim is a function that, when applied to code arguments,
@@ -42,7 +51,7 @@
   ;; arguments
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
-  (define-prims #:id?-name prim-id?
+  (define-prims #:id?/name prim-id? #:id->user-sym/name prim-id->user-sym
     + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number? println)
 
 
@@ -71,9 +80,7 @@
       [(run e1 e2) `(,(nominal-source-name #'run) (map replace-names/e (list #'e1 #'e2)))]
       [x:id
        (if (prim-id? #'x)
-           ;; This doesn't quite work; the nominal-source-id *and* the
-           ;; source-id are unfortunately both of the form ud:prim...
-           (nominal-source-name #'x)
+           (prim-id->user-sym #'x)
            (syntax-e #'x))]
       [_ (syntax->datum this-syntax)]))
 
