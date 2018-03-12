@@ -10,6 +10,7 @@
            check-true
            check-code?
            quote
+           module+
            (rename-out [ud:module-begin #%module-begin]
                        [ud:lambda lambda]
                        [ud:app #%app]
@@ -18,7 +19,9 @@
                        [ud:if if]
                        [ud:lift lift]
                        [ud:run run]
-                       [ud:define define]))
+                       [ud:define define]
+                       [ud:let let]
+                       #;(Make sure to update replace-names/exp, too)))
 
   (struct code (e)
     #:methods gen:custom-write
@@ -52,7 +55,7 @@
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
   (define-prims #:id?/name prim-id? #:id->user-sym/name prim-id->user-sym
-    + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number? println)
+    * + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number? println)
 
 
   ;; A hack so we can print code values (i.e. stx for expressions) in
@@ -67,7 +70,8 @@
                   [#%app ud:app]
                   [if ud:if]
                   [lift ud:lift]
-                  [run ud:run])
+                  [run ud:run]
+                  [let ud:let])
       [(lambda rec (args ...) body)
        `(,(nominal-source-name #'lambda)
          ,(syntax-e #'rec)
@@ -77,7 +81,8 @@
       [(#%app args ...) (map replace-names/exp (attribute args))]
       [(if e1 e2 e3) `(,(nominal-source-name #'if) ,@(map replace-names/exp (list #'e1 #'e2 #'e3)))]
       [(lift e) `(,(nominal-source-name #'lift) ,(replace-names/exp #'e))]
-      [(run e1 e2) `(,(nominal-source-name #'run) (map replace-names/e (list #'e1 #'e2)))]
+      [(run e1 e2) `(,(nominal-source-name #'run) ,@(map replace-names/exp (list #'e1 #'e2)))]
+      [(let ([x0 e0]) e) `(let ([,(syntax-e #'x0) ,(replace-names/exp #'e0)]) ,(replace-names/exp #'e))]
       [x:id
        (if (prim-id? #'x)
            (prim-id->user-sym #'x)
@@ -177,8 +182,8 @@
             #`(ud:lambda
                #,rec-fresh (#,@args-fresh)
                #,e)])]
-         [(prim _ id) id]
-         [(code e) #`(ud:lift #,e)]))
+        [(prim _ id) id]
+        [(code e) #`(ud:lift #,e)]))
     (code v-exp))
   (define print-eval? (make-parameter #f))
   (define-syntax (trace-eval stx)
@@ -246,28 +251,39 @@
                     #'e
                     #`(ud:lambda
                        _ (#,@(car idss))
-                       #,(loop (cdr idss)))))))]))
+                       #,(loop (cdr idss)))))))]
+      [(_ x:id e) #`(define x e)]))
 
   (define reference-for-eval (#%variable-reference))
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
     (syntax-parse stx
       [(_ forms ...+)
-         #`(#%module-begin
-            (define updown-mp (variable-reference->resolved-module-path reference-for-eval))
-            ;; Avoid parameterize around the module body because I don't
-            ;; know a way for that to work w/printing-module-begin
-            (let ([ns (make-base-empty-namespace)])
-              ;; Use namespace-attach-module because we need to share
-              ;; the eval-namespace parameter (or something like that,
-              ;; see https://goo.gl/ihKPSH)
-              (namespace-attach-module (current-namespace) updown-mp ns)
-              (parameterize ([current-namespace ns])
-                (namespace-require updown-mp))
-              (eval-namespace ns))
-            forms ...)]))
+       #`(#%module-begin
+          (define updown-mp (variable-reference->resolved-module-path reference-for-eval))
+          ;; Avoid parameterize around the module body because I don't
+          ;; know a way for that to work w/printing-module-begin
+          (let ([ns (make-base-empty-namespace)])
+            ;; Use namespace-attach-module because we need to share
+            ;; the eval-namespace parameter (or something like that,
+            ;; see https://goo.gl/ihKPSH)
+            (namespace-attach-module (current-namespace) updown-mp ns)
+            (parameterize ([current-namespace ns])
+              (namespace-require updown-mp))
+            (eval-namespace ns))
+          forms ...)]))
   (define-syntax-rule (check-code? e)
-    (check-pred code? e)))
+    (check-pred code? e))
+
+  (define-syntax (ud:let stx)
+    (syntax-parse stx
+      [(_ ([x0 e0]) e)
+       #`(let* ([x0 e0]
+                [x e])
+           (match* (x0 x)
+             [((code e0*) (code e*))
+              (code #`(ud:let ([x0 #,e0*]) #,e*))]
+             [(_ _) x]))])))
 
 (module test (submod ".." updown)
   ;; Datum can be lifted/run
@@ -359,4 +375,12 @@
   (define (k-#t) (super-equal? 10 10))
   (define (super-equal? x y) (equal? (equal? x y) (equal? y x)))
   (check-true (k-#t))
-  (check-code? (lift super-equal?)))
+  (check-code? (lift super-equal?))
+
+  (check-equal? (let ([n 13]) (add1 n)) 14)
+  (check-code? (let ([n (lift 13)]) (add1 n)))
+  (check-equal? (run 0 (let ([n (lift 13)]) (add1 n))) 14)
+
+  (define x 10)
+  (check-equal? x 10)
+  (check-equal? ((lambda _ (y) (add1 x)) 0) 11))
