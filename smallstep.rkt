@@ -46,8 +46,9 @@
                (run* (step (state-e s) (state-k s)))))
    (state e 'done)))
 
-(check-equal? (run 5) 5)
-(check-equal? (run '(add1 (add1 (add1 3)))) 6)
+(module+ test
+  (check-equal? (run 5) 5)
+  (check-equal? (run '(add1 (add1 (add1 3)))) 6))
 
 ;; If run is an evaluator, then I don't think there's much point in
 ;; applying it to some program and then lifting what comes out: when
@@ -62,15 +63,15 @@
        (if (inc? k)
            (state (add1 e) (inc-next k))
            (state e k)))))
+(module+ test
+  ;; TODO this produces a function whose body is `(5 inc . ,code-for-k))
+  ;; but we want just `(5 inc . ,k). When lifting a cons cell, in some
+  ;; form or another we have to unwrap code that appears in a cons cell.
+  (check-code? (lift (step-spec '(add1 5))))
 
-;; TODO this produces a function whose body is `(5 inc . ,code-for-k))
-;; but we want just `(5 inc . ,k). When lifting a cons cell, in some
-;; form or another we have to unwrap code that appears in a cons cell.
-(check-code? (lift (step-spec '(add1 5))))
-
-;; Funny enough, this one is still giving me trouble. Because inc?
-;; doesn't evaluate to a primitive or to code, the call to it with the
-;; code argument for k doesn't do what we want; it just passes the
-;; code along to inc?. And at that point things are murky (for
-;; example, car in the body of inc? is never called).
-#;(check-code? (lift (step-spec '5)))
+  ;; Funny enough, this one is still giving me trouble. Because inc?
+  ;; doesn't evaluate to a primitive or to code, the call to it with the
+  ;; code argument for k doesn't do what we want; it just passes the
+  ;; code along to inc?. And at that point things are murky (for
+  ;; example, car in the body of inc? is never called).
+  #;(check-code? (lift (step-spec '5))))
