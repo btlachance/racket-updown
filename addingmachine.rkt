@@ -29,16 +29,23 @@
 
 (define ((eval e) count)
   (if (inc? e)
-      ((eval (inc-e e)) (add1 count))
+      (let* ([e1 (inc-e e)]
+             [eval-e1 (eval e1)]
+             [ret (add1 count)])
+        (eval-e1 ret))
       (if (dec? e)
-          ((eval (dec-e e)) (sub1 count))
+          (let* ([e1 (dec-e e)]
+                 [eval-e1 (eval e1)]
+                 [ret (sub1 count)])
+            (eval-e1 ret))
           (if (mult? e)
-              ;; It's a weird semantics where other operations
-              ;; accumulate onto count but mult doesn't.. but this
-              ;; will do for now.
-              (let ([v1 ((eval (mult-e1 e)) count)])
-                (let ([v2 ((eval (mult-e2 e)) count)])
-                  (* v1 v2)))
+              (let* ([e1 (mult-e1 e)]
+                     [eval-e1 (eval e1)]
+                     [v1 (eval-e1 count)]
+                     [e2 (mult-e2 e)]
+                     [ret (* v1 count)]
+                     [eval-e2 (eval e2)])
+                (eval-e2 ret))
               count))))
 
 (module+ test
@@ -47,6 +54,6 @@
   (check-equal? ((run 0 (lift (eval mixed-exp))) 10) 9)
 
   (define mult-exp '(mult (add1 (add1 (add1 ret)))
-                          (add1 (sub1 (add1 (sub1 ret))))))
-  (check-equal? ((eval mult-exp) 0) 0)
-  (check-equal? ((run 0 (lift (eval mult-exp))) 0) 0))
+                          ret))
+  (check-equal? ((eval mult-exp) 1) 4)
+  (check-equal? ((run 0 (lift (eval mult-exp))) 1) 4))

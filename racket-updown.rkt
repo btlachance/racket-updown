@@ -2,6 +2,7 @@
 (module updown racket
   (require (for-syntax syntax/parse racket/syntax racket/match racket/pretty)
            syntax/parse
+           racket/syntax
            racket/struct
            rackunit)
   (provide #%top-interaction
@@ -20,7 +21,6 @@
                        [ud:lift lift]
                        [ud:run run]
                        [ud:define define]
-                       [ud:let let]
                        #;(Make sure to update replace-names/exp, too)))
 
   (struct code (e)
@@ -71,7 +71,8 @@
                   [if ud:if]
                   [lift ud:lift]
                   [run ud:run]
-                  [let ud:let])
+                  [let ud:let]
+                  [let* ud:let*])
       [(lambda rec (args ...) body)
        `(,(nominal-source-name #'lambda)
          ,(syntax-e #'rec)
@@ -82,7 +83,16 @@
       [(if e1 e2 e3) `(,(nominal-source-name #'if) ,@(map replace-names/exp (list #'e1 #'e2 #'e3)))]
       [(lift e) `(,(nominal-source-name #'lift) ,(replace-names/exp #'e))]
       [(run e1 e2) `(,(nominal-source-name #'run) ,@(map replace-names/exp (list #'e1 #'e2)))]
-      [(let ([x0 e0]) e) `(let ([,(syntax-e #'x0) ,(replace-names/exp #'e0)]) ,(replace-names/exp #'e))]
+      [((~or (~and let (~bind [letx 'let]))
+             (~and let* (~bind [letx 'let*])))
+        ([x0 e0] ...) e)
+       (match* ((attribute x0) (attribute e0))
+         [((list x0s ...) (list e0s ...))
+          `(,(attribute letx)
+               (,@(for/list ([x0 x0s]
+                             [e0 e0s])
+                    `[,(syntax-e x0) ,(replace-names/exp e0)]))
+             ,(replace-names/exp #'e))])]
       [x:id
        (if (prim-id? #'x)
            (prim-id->user-sym #'x)
@@ -173,9 +183,8 @@
         [(? symbol? s) #`(ud:datum . #,s)]
         [(? null? s) #`(ud:datum)]
         [(liftable-proc proc raw-proc rec args _)
-         (define rec-fresh (datum->syntax rec (gensym (syntax-e rec))))
-         (define args-fresh
-           (for/list ([arg args]) (datum->syntax arg (gensym (syntax-e arg)))))
+         (define rec-fresh (generate-temporary rec))
+         (define args-fresh (generate-temporaries args))
 
          (match (apply raw-proc (code rec-fresh) (for/list ([a-f args-fresh]) (code a-f)))
            [(code e)
@@ -275,15 +284,28 @@
   (define-syntax-rule (check-code? e)
     (check-pred code? e))
 
-  (define-syntax (ud:let stx)
+  ;; Creates a letx form using the internal id, which expands to
+  ;; Racket's binding for rktid; provides the forms as rktid
+  (define-syntax (make-letx stx)
     (syntax-parse stx
-      [(_ ([x0 e0]) e)
-       #`(let* ([x0 e0]
-                [x e])
-           (match* (x0 x)
-             [((code e0*) (code e*))
-              (code #`(ud:let ([x0 #,e0*]) #,e*))]
-             [(_ _) x]))])))
+      [(_ [internal:id rktid:id])
+       (with-syntax ([ooo (quote-syntax ...)])
+         #`(begin
+             (define-syntax (internal stx)
+               (syntax-parse stx
+                 [(_ ([x0 e0] ooo) e)
+                  (with-syntax ([(e0* ooo) (generate-temporaries (attribute e0))]
+                                [(e*) (generate-temporaries (list #'e))])
+                    #`(rktid ([x0 e0] ooo)
+                             (match* (x0 ooo e)
+                               [((code e0*) ooo (code e*))
+                                (code #`(internal ([x0 #,e0*] ooo) #,e*))]
+                               [(e0* ooo e*)
+                                e*])))]))
+             (provide (rename-out [internal rktid]))))]))
+  ;; Make sure to update replace-names/exp, too
+  (make-letx [ud:let let])
+  (make-letx [ud:let* let*]))
 
 (module test (submod ".." updown)
   ;; Datum can be lifted/run
@@ -378,7 +400,10 @@
   (check-code? (lift super-equal?))
 
   (check-equal? (let ([n 13]) (add1 n)) 14)
+  (check-equal? (let ([x 0] [y 1]) (+ x y)) 1)
+  (check-equal? (let* ([x 0] [x (add1 x)]) x) 1)
   (check-code? (let ([n (lift 13)]) (add1 n)))
+  (check-code? (let* ([x (lift 0)] [x (add1 x)]) x))
   (check-equal? (run 0 (let ([n (lift 13)]) (add1 n))) 14)
 
   (define x 10)
