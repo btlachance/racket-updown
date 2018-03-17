@@ -1,18 +1,21 @@
 #lang racket
 (module updown racket
   (require (for-syntax syntax/parse racket/syntax racket/match racket/pretty)
+           syntax/wrap-modbeg
            syntax/parse
            racket/syntax
            racket/struct
            rackunit)
-  (provide #%top-interaction
-           trace-eval
+  (provide trace-eval
            check-equal?
            check-true
            check-code?
            quote
            module+
+           let
+           let*
            (rename-out [ud:module-begin #%module-begin]
+                       [ud:top-interaction #%top-interaction]
                        [ud:lambda lambda]
                        [ud:app #%app]
                        [ud:datum #%datum]
@@ -29,7 +32,49 @@
        (make-constructor-style-printer
         (lambda (c) 'code)
         (lambda (c) (list (replace-names/exp (code-e c))))))])
-  (define not-code? (negate code?))
+
+  (struct binding (id exp))
+  (define reflected (make-parameter '()))
+  (define (reflect-exp exp)
+    (define tmp (generate-temporary))
+    (reflected (cons (binding tmp exp) (reflected)))
+    tmp)
+  (define (output-reflecteds reflected-bindings body)
+    ;; Don't output (let* ([x0 e0] ...+ [x e]) x); instead, simplify
+    ;; that to (let* ([x0 e0] ...+) e)
+    (define-values (reflected-bindings* body*)
+      (match reflected-bindings
+        [(list) (values reflected-bindings body)]
+        [(cons newest-b bs)
+         (if (and (identifier? body) (free-identifier=? (binding-id newest-b) body))
+             (values bs (binding-exp newest-b))
+             (values reflected-bindings body))]))
+
+    (define bindings
+      (map
+       (lambda (b) #`[#,(binding-id b) #,(binding-exp b)])
+       (reverse reflected-bindings*)))
+    (match bindings
+      [(list) body*]
+      [(list bs ...)
+       #`(let* #,bs #,body*)]))
+  (define (reify-for-code/unwrap thunk)
+    (parameterize ([reflected '()])
+      (match* ((thunk) (reflected))
+        [((code e) (list reflecteds ...))
+         (output-reflecteds reflecteds e)])))
+  (define (reifyv thunk #:ignore-when-void? [ignore-void? #f])
+    (parameterize ([reflected '()])
+      (match* ((thunk) (reflected))
+        [(v (list)) v]
+
+        ;; Used for module body/#%top-interaction
+        [((? void? _) bindings)
+         #:when ignore-void?
+         (void)]
+
+        [((code e) (list reflecteds ...))
+         (code (output-reflecteds reflecteds e))])))
 
   (define-syntax (define-prims stx)
     (syntax-parse stx
@@ -55,12 +100,15 @@
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
   (define-prims #:id?/name prim-id? #:id->user-sym/name prim-id->user-sym
-    * + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq? number? println)
+    * + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq?
+    number? println not)
 
 
   ;; A hack so we can print code values (i.e. stx for expressions) in
-  ;; the way that we provide the language bindings. It works except
-  ;; as mentioned below when given a prim-id?
+  ;; the way that we provide the language bindings. It's mostly
+  ;; reusing Racket's knowledge of the identifiers, expect for the
+  ;; prim-id's---identifier-binding for some reason gives back a
+  ;; nominal-source-id and source-id that are both of the form ud:x
   (define (replace-names/exp stx)
     (define (nominal-source-name id) (fourth (identifier-binding id)))
 
@@ -71,8 +119,8 @@
                   [if ud:if]
                   [lift ud:lift]
                   [run ud:run]
-                  [let ud:let]
-                  [let* ud:let*])
+                  let
+                  let*)
       [(lambda rec (args ...) body)
        `(,(nominal-source-name #'lambda)
          ,(syntax-e #'rec)
@@ -83,12 +131,11 @@
       [(if e1 e2 e3) `(,(nominal-source-name #'if) ,@(map replace-names/exp (list #'e1 #'e2 #'e3)))]
       [(lift e) `(,(nominal-source-name #'lift) ,(replace-names/exp #'e))]
       [(run e1 e2) `(,(nominal-source-name #'run) ,@(map replace-names/exp (list #'e1 #'e2)))]
-      [((~or (~and let (~bind [letx 'let]))
-             (~and let* (~bind [letx 'let*])))
+      [((~and form (~or let let*))
         ([x0 e0] ...) e)
        (match* ((attribute x0) (attribute e0))
          [((list x0s ...) (list e0s ...))
-          `(,(attribute letx)
+          `(,(syntax-e #'form)
                (,@(for/list ([x0 x0s]
                              [e0 e0s])
                     `[,(syntax-e x0) ,(replace-names/exp e0)]))
@@ -141,7 +188,7 @@
     (match* ((car args) (cdr args))
       [((or (prim _ e-rator) (code e-rator))
         (list (code e-rands) ...))
-       (code #`(ud:app #,e-rator #,@e-rands))]
+       (code (reflect-exp #`(ud:app #,e-rator #,@e-rands)))]
 
       [((or (prim rator _) (? liftable-proc? rator))
         (list rands ...))
@@ -150,19 +197,10 @@
   (define-syntax-rule (ud:if e1 e2 e3)
     (match e1
       [(code e)
-       (match* (e2 e3)
-         [((code e2*) (code e3*))
-          (code #`(ud:if #,e #,e2* #,e3*))]
-         [(v2 v3)
-          (raise-arguments-error
-           'lift
-           "Expected both branches of an if expression to produce code"
-           "test" (syntax->datum #'e1)
-           "produced code" (syntax->datum e)
-           "then branch" (syntax->datum #'e2)
-           "produced" v2
-           "else branch" (syntax->datum #'e3)
-           "produced" v3)])]
+       (code
+        #`(ud:if #,e
+                 #,(reify-for-code/unwrap (thunk e2))
+                 #,(reify-for-code/unwrap (thunk e3))))]
       [#f e3]
       [_ e2]))
   (define-syntax-rule (ud:if0 e1 e2 e3)
@@ -186,13 +224,11 @@
          (define rec-fresh (generate-temporary rec))
          (define args-fresh (generate-temporaries args))
 
-         (match (apply raw-proc (code rec-fresh) (for/list ([a-f args-fresh]) (code a-f)))
-           [(code e)
-            #`(ud:lambda
-               #,rec-fresh (#,@args-fresh)
-               #,e)])]
+         #`(ud:lambda
+            #,rec-fresh #,args-fresh
+            #,(reify-for-code/unwrap (thunk (apply raw-proc (code rec-fresh) (for/list ([a-f args-fresh]) (code a-f))))))]
         [(prim _ id) id]
-        [(code e) #`(ud:lift #,e)]))
+        [(code e) (reflect-exp #`(ud:lift #,e))]))
     (code v-exp))
   (define print-eval? (make-parameter #f))
   (define-syntax (trace-eval stx)
@@ -222,8 +258,7 @@
         (match e
           [(code e-code) #`(ud:run #,b1 #,e-code)]))]
       [_
-       (match e
-         [(code e-code) (eval-code-exp e-code)])]))
+       (reifyv (thunk (eval-code-exp (reify-for-code/unwrap (thunk e)))))]))
 
   (define-syntax (ud:define stx)
     (let ([error-msg/#f
@@ -263,49 +298,38 @@
                        #,(loop (cdr idss)))))))]
       [(_ x:id e) #`(define x e)]))
 
+  (define-syntax (wrap-reifyv stx)
+    (syntax-case stx ()
+      ;; I'm not certain we can just ignore any bindings that get
+      ;; accumulated because of e, but if the whole thing evaluates to
+      ;; void then I don't see what else we could do with the
+      ;; bindings.
+      [(_ e) #'(reifyv (thunk e) #:ignore-when-void? #t)]))
+  (define-syntax reifyv-module-begin (make-wrapping-module-begin #'wrap-reifyv #'#%printing-module-begin))
+
   (define reference-for-eval (#%variable-reference))
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
     (syntax-parse stx
       [(_ forms ...+)
-       #`(#%module-begin
+       #`(reifyv-module-begin
           (define updown-mp (variable-reference->resolved-module-path reference-for-eval))
-          ;; Avoid parameterize around the module body because I don't
-          ;; know a way for that to work w/printing-module-begin
-          (let ([ns (make-base-empty-namespace)])
-            ;; Use namespace-attach-module because we need to share
-            ;; the eval-namespace parameter (or something like that,
-            ;; see https://goo.gl/ihKPSH)
-            (namespace-attach-module (current-namespace) updown-mp ns)
-            (parameterize ([current-namespace ns])
-              (namespace-require updown-mp))
-            (eval-namespace ns))
+          (define _
+            ;; Avoid parameterize around the module body because I don't
+            ;; know a way for that to work w/printing-module-begin
+            (let ([ns (make-base-empty-namespace)])
+              ;; Use namespace-attach-module because we need to share
+              ;; the eval-namespace parameter (or something like that,
+              ;; see https://goo.gl/ihKPSH)
+              (namespace-attach-module (current-namespace) updown-mp ns)
+              (parameterize ([current-namespace ns])
+                (namespace-require updown-mp))
+              (eval-namespace ns)))
           forms ...)]))
-  (define-syntax-rule (check-code? e)
-    (check-pred code? e))
-
-  ;; Creates a letx form using the internal id, which expands to
-  ;; Racket's binding for rktid; provides the forms as rktid
-  (define-syntax (make-letx stx)
-    (syntax-parse stx
-      [(_ [internal:id rktid:id])
-       (with-syntax ([ooo (quote-syntax ...)])
-         #`(begin
-             (define-syntax (internal stx)
-               (syntax-parse stx
-                 [(_ ([x0 e0] ooo) e)
-                  (with-syntax ([(e0* ooo) (generate-temporaries (attribute e0))]
-                                [(e*) (generate-temporaries (list #'e))])
-                    #`(rktid ([x0 e0] ooo)
-                             (match* (x0 ooo e)
-                               [((code e0*) ooo (code e*))
-                                (code #`(internal ([x0 #,e0*] ooo) #,e*))]
-                               [(e0* ooo e*)
-                                e*])))]))
-             (provide (rename-out [internal rktid]))))]))
-  ;; Make sure to update replace-names/exp, too
-  (make-letx [ud:let let])
-  (make-letx [ud:let* let*]))
+  (define-syntax (ud:top-interaction stx)
+    (syntax-case stx ()
+      [(_ . f) #'(wrap-reifyv f)]))
+  (define-syntax-rule (check-code? e) (check-pred code? e)))
 
 (module test (submod ".." updown)
   ;; Datum can be lifted/run
@@ -392,6 +416,12 @@
                 ((matches?-spec (cdr r)) (cdr s))
                 (lift #f)))))
   (check-true ((run 0 (lift (matches?-spec '(a b)))) '(a b c)))
+
+  ;; A factorial function like the one in the paper's fig 7
+  (check-code? (lift (lambda fac (n)
+                             (if (not (zero? n))
+                                 (* n (fac (sub1 n)))
+                                 (lift 1)))))
 
   ;; More than just unary functions
   (define (k-#t) (super-equal? 10 10))
