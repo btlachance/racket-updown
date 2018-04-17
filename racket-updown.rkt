@@ -12,6 +12,7 @@
            check-code?
            quote
            module+
+           begin
            let
            let*
            (rename-out [ud:module-begin #%module-begin]
@@ -100,7 +101,7 @@
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
   (define-prims #:id?/name prim-id? #:id->user-sym/name prim-id->user-sym
-    * + add1 sub1 cons car cdr cadr caddr cadddr null? pair?
+    * + - add1 sub1 cons car cdr cadr caddr cadddr null? pair?
     zero? equal? eq? number? symbol? println not list)
 
 
@@ -166,11 +167,13 @@
 
   (define-syntax (ud:datum stx)
     (syntax-parse stx
-      [(_ . d:boolean) #`(#%datum . d)]
-      [(_ . d:number) #`(#%datum . d)]
-      [(_ . d:id) #`(#%datum . d)]
-      [(_) #`(#%datum)]
-      [(_ a . b) #`(#%datum a . b)]))
+      [(_ . d) #`(#%datum . d)]))
+  (define-syntax (ud:quote stx)
+    (syntax-parse stx
+      [(_ (a . b))
+       #`(ud:app ud:cons (ud:quote a) (ud:quote b))]
+      [(_ s)
+       #`(ud:datum . s)]))
 
   (define-syntax (ud:app stx)
     (syntax-parse stx
@@ -188,7 +191,7 @@
     (match* ((car args) (cdr args))
       [((or (prim _ e-rator) (code e-rator))
         (list (code e-rands) ...))
-       (code (reflect-exp #`(ud:app #,e-rator #,@e-rands)))]
+       (code (reflect-exp (quasisyntax/loc (car (syntax-e stxs)) (ud:app #,e-rator #,@e-rands))))]
 
       [((or (prim rator _) (? liftable-proc? rator))
         (list rands ...))
@@ -227,9 +230,10 @@
         [(? number? n) n]
         [(? symbol? s)
          ;; Symbols still feel weird. But this + the stuff with cons
-         ;; above seems to do what I think I want.
-         #`'#,s]
-        [(? null? s) s]
+         ;; above seems to do what I think I want. Unclear: why not
+         ;; use ud:quote here? (Tests fail, but why?)
+         #`(quote #,s)]
+        [(? null? s) #`(ud:datum)]
         [(liftable-proc proc raw-proc rec args _)
          (define rec-fresh (generate-temporary rec))
          (define args-fresh (generate-temporaries args))
@@ -321,7 +325,7 @@
   (define eval-namespace (make-parameter #f))
   (define-syntax (ud:module-begin stx)
     (syntax-parse stx
-      [(_ forms ...+)
+      [(_ forms ...)
        #`(reifyv-module-begin
           (define updown-mp (variable-reference->resolved-module-path reference-for-eval))
           (define _
@@ -390,6 +394,7 @@
   (check-equal? (run 0 (lift '(1 . 2))) '(1 . 2))
   (check-code? (lift '(1 2)))
   (check-equal? (run 0 (lift (cons 1 (cons 2 '())))) '(1 2))
+  (check-equal? (run 0 (lift '())) '())
 
   (check-code? (lift 'a))
   (check-equal? (run 0 (lift 'a)) 'a)
