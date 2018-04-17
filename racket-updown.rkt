@@ -33,7 +33,7 @@
         (lambda (c) 'code)
         (lambda (c) (list (replace-names/exp (code-e c))))))])
 
-  (struct binding (id exp))
+  (struct binding (id exp) #:transparent)
   (define reflected (make-parameter '()))
   (define (reflect-exp exp)
     (define tmp (generate-temporary))
@@ -100,8 +100,8 @@
   (struct prim (proc id)
     #:property prop:procedure (struct-field-index proc))
   (define-prims #:id?/name prim-id? #:id->user-sym/name prim-id->user-sym
-    * + add1 sub1 cons car cdr cadr null? pair? zero? equal? eq?
-    number? println not)
+    * + add1 sub1 cons car cdr cadr caddr cadddr null? pair?
+    zero? equal? eq? number? symbol? println not list)
 
 
   ;; A hack so we can print code values (i.e. stx for expressions) in
@@ -211,15 +211,25 @@
   (define (lift v)
     (define v-exp
       (match v
-        ;; Not clear if we should be traversing v in some way---before
-        ;; I added booleans to ud:datum, I was able to lift '(#t). And
-        ;; lifting cons like this is going to be buggy when there's
-        ;; e.g. a function or code in the cons cell.
-        [(? boolean? b) #`(ud:datum . #,b)]
-        [(cons a b) #`(ud:datum #,a . #,b)]
-        [(? number? n) #`(ud:datum . #,n)]
-        [(? symbol? s) #`(ud:datum . #,s)]
-        [(? null? s) #`(ud:datum)]
+        [(? boolean? b) b]
+        [(cons a b)
+         (define (unpack-code v)
+           (match v
+             [(code e)
+              (syntax-parse e
+                #:literals (quote)
+                [(quote i:id) (syntax-e #'i)]
+                [_ this-syntax])]
+             [(cons a* b*)
+              (cons (unpack-code a*) (unpack-code b*))]
+             [_ v]))
+         #`(ud:datum #,(unpack-code a) . #,(unpack-code b))]
+        [(? number? n) n]
+        [(? symbol? s)
+         ;; Symbols still feel weird. But this + the stuff with cons
+         ;; above seems to do what I think I want.
+         #`'#,s]
+        [(? null? s) s]
         [(liftable-proc proc raw-proc rec args _)
          (define rec-fresh (generate-temporary rec))
          (define args-fresh (generate-temporaries args))
@@ -438,4 +448,10 @@
 
   (define x 10)
   (check-equal? x 10)
-  (check-equal? ((lambda _ (y) (add1 x)) 0) 11))
+  (check-equal? ((lambda _ (y) (add1 x)) 0) 11)
+
+  ;; This one feels weird, but without it I'm otherwise not sure how
+  ;; to represent small step states. Maybe I should be reifying the
+  ;; lifted number/symbol...
+  (define list-with-code (list 'state 'ret (lift 0) (lift 'kdone)))
+  (check-equal? (run 0 (lift list-with-code)) '(state ret 0 kdone)))
