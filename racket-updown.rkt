@@ -192,6 +192,9 @@
       [(_ (a . b)) #`(ud:app ud:cons (ud:quote a) (ud:quote b))]
       [(_ s) #`(ud:datum . s)]))
 
+  (define-syntax (ud:app stx)
+    (syntax-parse stx
+      [(_ rator rands ...) #`(#%app rator rands ...)]))
   (define (exp-for-app rator . rands)
     (define rator-stx
       (if (prim? rator)
@@ -199,36 +202,16 @@
           (code-e rator)))
     #`(ud:app #,rator-stx #,@(map code-e rands)))
 
-  (define-syntax (ud:app stx)
-    (syntax-parse stx
-      [(_ rator rands ...) #`(#%app rator rands ...)]))
-
-  (begin-for-syntax
-    (define-syntax-class with-binding
-      #:attributes (exp binding)
-      (pattern :atomic
-               #:attr exp this-syntax
-               #:attr binding #f)
-      (pattern e
-               #:attr exp (generate-temporary #'e)
-               #:attr binding #`[exp e]))
-    (define-syntax-class atomic
-      (pattern :id)
-      (pattern :boolean)
-      (pattern :number)))
   (define-syntax (ud:if stx)
     (syntax-parse stx
-      [(_ test:atomic then else)
-       #`(if (code? test)
-             (code (exp-for-if test (thunk then) (thunk else)))
-             (if test
-                 then
-                 else))]
-      [(_ test:with-binding then else)
-       (if (attribute test.binding)
-           #`(let (test.binding)
-               (ud:if test.exp then else))
-           #`(ud:if test.exp then else))]))
+      [(_ test then else)
+       #`(do-if test (thunk then) (thunk else))]))
+  (define (do-if test then-thunk else-thunk)
+    (if (code? test)
+        (code (exp-for-if test then-thunk else-thunk))
+        (if test
+            (then-thunk)
+            (else-thunk))))
   (define (exp-for-if test then-thunk else-thunk)
     #`(ud:if #,(code-e test)
              #,(reify-for-code/unwrap then-thunk)
