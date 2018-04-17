@@ -28,6 +28,11 @@
                        #;(Make sure to update replace-names/exp, too)))
 
   (struct code (e)
+    #:property prop:procedure
+    (lambda (c . args)
+      (if (andmap code? args)
+          (code (reflect-exp (apply exp-for-app c args)))
+          (error 'foo)))
     #:methods gen:custom-write
     [(define write-proc
        (make-constructor-style-printer
@@ -93,7 +98,12 @@
                (define syms `((,#'ud:prim ,'prim-name) ...))
                (match (assoc prim-id syms free-identifier=?)
                  [(list _ user-sym) user-sym]))
-             (define ud:prim (prim prim-name #'ud:prim)) ...
+             (define (make-prim-proc prim ud:prim/thunk)
+               (lambda args
+                 (if (andmap code? args)
+                     (code (reflect-exp (apply exp-for-app (ud:prim/thunk) args)))
+                     (apply prim args))))
+             (define ud:prim (prim (make-prim-proc prim-name (lambda () ud:prim)) #'ud:prim)) ...
              (provide (rename-out [ud:prim prim-name] ...))))]))
   ;; a prim is a function that, when applied to code arguments,
   ;; produces code for applying the prim to the contents of the code
@@ -182,6 +192,17 @@
       [(_ (a . b)) #`(ud:app ud:cons (ud:quote a) (ud:quote b))]
       [(_ s) #`(ud:datum . s)]))
 
+  (define (exp-for-app rator . rands)
+    (define rator-stx
+      (if (prim? rator)
+          (prim-id rator)
+          (code-e rator)))
+    #`(ud:app #,rator-stx #,@(map code-e rands)))
+
+  (define-syntax (ud:app stx)
+    (syntax-parse stx
+      [(_ rator rands ...) #`(#%app rator rands ...)]))
+
   (begin-for-syntax
     (define-syntax-class with-binding
       #:attributes (exp binding)
@@ -195,34 +216,6 @@
       (pattern :id)
       (pattern :boolean)
       (pattern :number)))
-
-  (define (exp-for-app rator . rands)
-    (define rator-stx
-      (if (prim? rator)
-          (prim-id rator)
-          (code-e rator)))
-    #`(ud:app #,rator-stx #,@(map code-e rands)))
-
-  (define-syntax (ud:app stx)
-    (syntax-parse stx
-      [(_ rator:atomic rands:atomic ...)
-       #`(if (and (or (prim? rator) (code? rator)) (code? rands) ...)
-             (code (reflect-exp (exp-for-app rator rands ...)))
-             (#%app rator rands ...))]
-      [(_ e:with-binding ...)
-       (define bindings (filter values (attribute e.binding)))
-       (define exps (attribute e.exp))
-
-       (if (null? bindings)
-           #`(ud:app #,@exps)
-           #`(let (#,@bindings)
-               (ud:app #,@exps)))]))
-
-  (define (exp-for-if test then-thunk else-thunk)
-    #`(ud:if #,(code-e test)
-             #,(reify-for-code/unwrap then-thunk)
-             #,(reify-for-code/unwrap else-thunk)))
-
   (define-syntax (ud:if stx)
     (syntax-parse stx
       [(_ test:atomic then else)
@@ -236,6 +229,10 @@
            #`(let (test.binding)
                (ud:if test.exp then else))
            #`(ud:if test.exp then else))]))
+  (define (exp-for-if test then-thunk else-thunk)
+    #`(ud:if #,(code-e test)
+             #,(reify-for-code/unwrap then-thunk)
+             #,(reify-for-code/unwrap else-thunk)))
 
   (define-syntax-rule (ud:if0 e1 e2 e3)
     ;; Tricky: need to expand to ud:app/ud:zero?
