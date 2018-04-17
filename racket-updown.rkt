@@ -10,7 +10,6 @@
            check-equal?
            check-true
            check-code?
-           quote
            module+
            begin
            let
@@ -25,6 +24,7 @@
                        [ud:lift lift]
                        [ud:run run]
                        [ud:define define]
+                       [ud:quote quote]
                        #;(Make sure to update replace-names/exp, too)))
 
   (struct code (e)
@@ -120,6 +120,7 @@
                   [if ud:if]
                   [lift ud:lift]
                   [run ud:run]
+                  ;; what about ud:quote/quote?
                   let
                   let*)
       [(lambda rec (args ...) body)
@@ -137,19 +138,19 @@
        (match* ((attribute x0) (attribute e0))
          [((list x0s ...) (list e0s ...))
           `(,(syntax-e #'form)
-               (,@(for/list ([x0 x0s]
-                             [e0 e0s])
-                    `[,(syntax-e x0) ,(replace-names/exp e0)]))
-             ,(replace-names/exp #'e))])]
+            (,@(for/list ([x0 x0s]
+                          [e0 e0s])
+                 `[,(syntax-e x0) ,(replace-names/exp e0)]))
+            ,(replace-names/exp #'e))])]
       [x:id
        (if (prim-id? #'x)
            (prim-id->user-sym #'x)
            (syntax-e #'x))]
       [_ (syntax->datum this-syntax)]))
 
-
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
+      [(_ (x:id ...) e) #`(ud:lambda _ (x ...) e)]
       [(_ rec:id (x:id ...) e:expr)
        (with-syntax ([raw-rec (format-id #'rec "raw-~a" #'rec)])
          ;; A bit of a mess but it lets us use the normal Racket
@@ -170,32 +171,44 @@
       [(_ . d) #`(#%datum . d)]))
   (define-syntax (ud:quote stx)
     (syntax-parse stx
-      [(_ (a . b))
-       #`(ud:app ud:cons (ud:quote a) (ud:quote b))]
-      [(_ s)
-       #`(ud:datum . s)]))
+      [(_ (a . b)) #`(ud:app ud:cons (ud:quote a) (ud:quote b))]
+      [(_ s) #`(ud:datum . s)]))
+
+  (begin-for-syntax
+    (define-syntax-class with-binding
+      #:attributes (exp binding)
+      (pattern :atomic
+               #:attr exp this-syntax
+               #:attr binding #f)
+      (pattern e
+               #:attr exp (generate-temporary #'e)
+               #:attr binding #`[exp e]))
+    (define-syntax-class atomic
+      (pattern :id)
+      (pattern :boolean)
+      (pattern :number)))
+
+  (define (exp-for-app rator . rands)
+    (define rator-stx
+      (if (prim? rator)
+          (prim-id rator)
+          (code-e rator)))
+    #`(ud:app #,rator-stx #,@(map code-e rands)))
 
   (define-syntax (ud:app stx)
     (syntax-parse stx
-      [(_ e ...)
-       ;; TODO Ditch call-or-code (and thus apply) by compiling to
-       ;; match*/case dispatch/function applications here
-       #`(call-or-code (list e ...) #'(e ...))]))
-  ;; App needs to either produce a value or produce code. First, we
-  ;; run the arguments down to a list of values (which gets bound to
-  ;; args). We implicitly lift primitive functions, but I'm not sure
-  ;; if that's the right thing to do---what if it was an effectful
-  ;; operation that evaluated to a prim?---maybe they should have to
-  ;; be explicitly lifted.
-  (define (call-or-code args stxs)
-    (match* ((car args) (cdr args))
-      [((or (prim _ e-rator) (code e-rator))
-        (list (code e-rands) ...))
-       (code (reflect-exp (quasisyntax/loc (car (syntax-e stxs)) (ud:app #,e-rator #,@e-rands))))]
+      [(_ rator:atomic rands:atomic ...)
+       #`(if (and (or (prim? rator) (code? rator)) (code? rands) ...)
+             (code (reflect-exp (exp-for-app rator rands ...)))
+             (#%app rator rands ...))]
+      [(_ e:with-binding ...)
+       (define bindings (filter values (attribute e.binding)))
+       (define exps (attribute e.exp))
 
-      [((or (prim rator _) (? liftable-proc? rator))
-        (list rands ...))
-       (apply rator rands)]))
+       (if (null? bindings)
+           #`(ud:app #,@exps)
+           #`(let (#,@bindings)
+               (ud:app #,@exps)))]))
 
   (define-syntax-rule (ud:if e1 e2 e3)
     (match e1
@@ -308,7 +321,7 @@
                 (if (null? idss)
                     #'e
                     #`(ud:lambda
-                       _ (#,@(car idss))
+                       (#,@(car idss))
                        #,(loop (cdr idss)))))))]
       [(_ x:id e) #`(define x e)]))
 
