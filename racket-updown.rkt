@@ -150,7 +150,15 @@
 
   (define-syntax (ud:lambda stx)
     (syntax-parse stx
-      [(_ (x:id ...) e) #`(ud:lambda _ (x ...) e)]
+      [(_ (x:id ...) e)
+       #`(let* ([raw-proc (lambda (_ x ...) e)]
+                [proc (liftable-proc
+                       (lambda (x ...) (raw-proc (void) x ...))
+                       raw-proc
+                       #f
+                       (syntax->list #'(x ...))
+                       #'e)])
+           proc)]
       [(_ rec:id (x:id ...) e:expr)
        (with-syntax ([raw-rec (format-id #'rec "raw-~a" #'rec)])
          ;; A bit of a mess but it lets us use the normal Racket
@@ -210,15 +218,25 @@
            #`(let (#,@bindings)
                (ud:app #,@exps)))]))
 
-  (define-syntax-rule (ud:if e1 e2 e3)
-    (match e1
-      [(code e)
-       (code
-        #`(ud:if #,e
-                 #,(reify-for-code/unwrap (thunk e2))
-                 #,(reify-for-code/unwrap (thunk e3))))]
-      [#f e3]
-      [_ e2]))
+  (define (exp-for-if test then-thunk else-thunk)
+    #`(ud:if #,(code-e test)
+             #,(reify-for-code/unwrap then-thunk)
+             #,(reify-for-code/unwrap else-thunk)))
+
+  (define-syntax (ud:if stx)
+    (syntax-parse stx
+      [(_ test:atomic then else)
+       #`(if (code? test)
+             (code (exp-for-if test (thunk then) (thunk else)))
+             (if test
+                 then
+                 else))]
+      [(_ test:with-binding then else)
+       (if (attribute test.binding)
+           #`(let (test.binding)
+               (ud:if test.exp then else))
+           #`(ud:if test.exp then else))]))
+
   (define-syntax-rule (ud:if0 e1 e2 e3)
     ;; Tricky: need to expand to ud:app/ud:zero?
     (ud:if (ud:app ud:zero? e1) e2 e3))
